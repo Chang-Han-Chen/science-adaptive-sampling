@@ -1,0 +1,29 @@
+# Project page for "The Science of Adaptive Sampling", served by GitHub Pages from main (/).
+
+title: "The Science of Adaptive Sampling"
+description: "What should we spend the next rollout on, once a prompt already has a learning signal?"
+url: "https://chang-han-chen.github.io"
+baseurl: "/science-adaptive-sampling"
+
+# Build settings (same stack as chang-han-chen.github.io and subliminal-watermarks.github.io)
+markdown: kramdown
+kramdown:
+  input: GFM
+  math_engine: mathjax
+  auto_ids: true
+highlighter: rouge
+timezone: America/Los_Angeles
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: article
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+  - vendor
+  - .bundle
+  - .jekyll-cache

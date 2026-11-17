@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neyman allocation for pairs: where the next rollouts go</title>
+<style>
+:root {
+  --ink: #0b0b0b; --muted: #52514e; --grid: #eceef0; --axis: #b8bec4; --border: #e1e4e8; --soft: #f6f8fa;
+  --probe: #2a78d6; --bought: #9cc3ef; --target: #eb6834; --ok: #1baf7a; --fail: #d5d9dd;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: #fff; color: var(--ink); }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 15px; line-height: 1.45; }
+.wrap { padding: 2px 2px 4px; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 0 4px 6px; font-size: 13.5px; }
+.controls label { color: var(--muted); }
+.controls input[type=range] { flex: 1 1 200px; accent-color: var(--probe); margin: 0; }
+.controls output { font-weight: 600; font-variant-numeric: tabular-nums; min-width: 4.5em; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { font: inherit; font-size: 13px; padding: 3px 11px; border: 0; border-right: 1px solid var(--border); background: #fff; color: var(--ink); cursor: pointer; }
+.seg button:last-child { border-right: 0; }
+.seg button.on { background: var(--ink); color: #fff; }
+svg { width: 100%; display: block; overflow: visible; }
+svg text { font-family: inherit; fill: var(--muted); font-size: 11px; }
+svg text.name { fill: var(--ink); font-size: 13px; font-weight: 700; }
+svg text.buy { fill: var(--ink); font-size: 12px; font-weight: 600; }
+svg text.buy.zero { fill: var(--muted); font-weight: 400; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 6px 0; font-size: 12.5px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.sw.line { height: 0; border-top: 2px dashed var(--target); border-radius: 0; width: 16px; }
+.readout { margin: 8px 0 0; padding: 8px 12px; background: var(--soft); border-radius: 6px; font-size: 14px; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="controls">
+    <label for="budget">Compute budget</label>
+    <input type="range" id="budget" min="0" max="150000" step="1000" value="50000" aria-label="Compute budget after the probes">
+    <output id="o-budget"></output>
+    <div class="seg" role="group" aria-label="Allocation rule">
+      <button type="button" data-mode="wf" class="on">Neyman allocation</button>
+      <button type="button" data-mode="uni">Same for every prompt</button>
+    </div>
+  </div>
+  <svg id="chart" role="img" aria-label="Success–failure pairs per prompt: from the probe, bought with the budget, and each prompt's target"></svg>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--probe)"></i>pairs from the 8-rollout probe</span>
+    <span><i class="sw" style="background:var(--bought)"></i>pairs bought with the budget</span>
+    <span id="lg-target"><i class="sw line"></i>target</span>
+  </div>
+  <p class="readout" id="readout"></p>
+</div>
+<script>
+(function () {
+'use strict';
+var LAM = 0.02;
+// Five prompts after an 8-rollout probe: successes s, success rate p, rollout length T (tokens, prompt included).
+var PROMPTS = [
+  { name: 'A', s: 1, p: 0.15, T: 500 },
+  { name: 'B', s: 4, p: 0.50, T: 200 },
+  { name: 'C', s: 2, p: 0.30, T: 900 },
+  { name: 'D', s: 7, p: 0.85, T: 400 },
+  { name: 'E', s: 3, p: 0.40, T: 1300 }
+];
+function w(p) { return p * (1 - p) * (1 / (p + LAM) + 1 / (1 - p + LAM)); }
+function D(p) { return p * p + (1 - p) * (1 - p); }
+PROMPTS.forEach(function (q) {
+  q.K0 = Math.min(q.s, 8 - q.s);              // pairs in the probe
+  q.q = Math.min(q.p, 1 - q.p);              // new pairs per extra rollout
+  q.a = q.T * w(q.p) * w(q.p) / D(q.p);      // noise per pair (relative units)
+  q.c = q.T * (1 / q.q + 4);      // compute per extra pair: generate 1/q rollouts, train 2 sequences
+  q.r = Math.sqrt(q.a / q.c);                // target pairs per unit of the level theta
+});
+function bisect(spend, C) {
+  var lo = 0, hi = 1e4;
+  for (var i = 0; i < 100; i++) { var m = (lo + hi) / 2; if (spend(m) > C) hi = m; else lo = m; }
+  return lo;
+}
+function neymanPairs(C) {
+  var th = bisect(function (t) { return PROMPTS.reduce(function (s, q) { return s + q.c * (Math.max(q.K0, t * q.r) - q.K0); }, 0); }, C);
+  return { level: th, K: PROMPTS.map(function (q) { return Math.max(q.K0, th * q.r); }) };
+}
+function uniform(C) {
+  var m = bisect(function (n) { return PROMPTS.reduce(function (s, q) { return s + q.c * q.q * n; }, 0); }, C);
+  return { K: PROMPTS.map(function (q) { return q.K0 + q.q * m; }) };
+}
+function noise(K) { return PROMPTS.reduce(function (s, q, i) { return s + q.a / K[i]; }, 0); }
+
+var state = { budget: 50000, mode: 'wf' };
+var svg = document.getElementById('chart'), NS = 'http://www.w3.org/2000/svg';
+function S(tag, attrs, parent, text) {
+  var e = document.createElementNS(NS, tag);
+  for (var k in attrs) e.setAttribute(k, attrs[k]);
+  if (text != null) e.textContent = text;
+  parent.appendChild(e); return e;
+}
+function fmt(x) { return Math.round(x).toLocaleString('en-US'); }
+
+function render() {
+  document.getElementById('o-budget').textContent = (state.budget / 1000).toFixed(0) + 'k';
+  var wf = neymanPairs(state.budget), un = uniform(state.budget);
+  var res = state.mode === 'wf' ? wf : un;
+  var W = svg.clientWidth || 600, H = W < 480 ? 290 : 300;
+  var m = { l: 34, r: 8, t: 26, b: 70 }, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  var YMAX = 12, Y = function (k) { return m.t + ih * (1 - Math.min(k, YMAX) / YMAX); };
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H); svg.setAttribute('height', H);
+  [0, 2, 4, 6, 8, 10, 12].forEach(function (t) {
+    S('line', { x1: m.l, x2: m.l + iw, y1: Y(t), y2: Y(t), stroke: 'var(--grid)' }, svg);
+    S('text', { x: m.l - 6, y: Y(t) + 3.5, 'text-anchor': 'end' }, svg, t);
+  });
+  S('text', { x: 10, y: m.t + ih / 2, 'text-anchor': 'middle', transform: 'rotate(-90 10 ' + (m.t + ih / 2) + ')' }, svg, 'pairs');
+  var col = iw / PROMPTS.length, gw = Math.min(54, col * 0.56), narrow = col < 95;
+  PROMPTS.forEach(function (q, i) {
+    var cx = m.l + col * (i + 0.5), x = cx - gw / 2, K = res.K[i];
+    S('rect', { x: x, y: Y(YMAX), width: gw, height: ih, rx: 5, fill: '#fafbfc', stroke: 'var(--border)' }, svg);
+    S('rect', { x: x + 1, y: Y(K), width: gw - 2, height: Y(q.K0) - Y(K), fill: 'var(--bought)' }, svg);
+    S('rect', { x: x + 1, y: Y(q.K0), width: gw - 2, height: Y(0) - Y(q.K0) - 1, rx: 3, fill: 'var(--probe)' }, svg);
+    if (state.mode === 'wf') {
+      var tgt = wf.level * q.r;
+      S('line', { x1: x - 5, x2: x + gw + 5, y1: Y(tgt), y2: Y(tgt), stroke: 'var(--target)', 'stroke-width': 2, 'stroke-dasharray': '5 3' }, svg);
+    }
+    var n = Math.round((K - q.K0) / q.q);
+    S('text', { x: cx, y: Math.min(Y(K), Y(YMAX)) - 8, 'text-anchor': 'middle', class: 'buy' + (n === 0 ? ' zero' : '') }, svg, n === 0 ? '+0' : '+' + n + (narrow ? '' : ' rollouts'));
+    S('text', { x: cx, y: Y(0) + 17, 'text-anchor': 'middle', class: 'name' }, svg, q.name);
+    var dot = Math.min(6, (gw + 18) / 8 - 1.5), dx = dot + 1.6, x0 = cx - 4 * dx + dx / 2;
+    for (var j = 0; j < 8; j++) S('circle', { cx: x0 + j * dx, cy: Y(0) + 30, r: dot / 2, fill: j < q.s ? 'var(--ok)' : 'var(--fail)' }, svg);
+    if (narrow) {
+      S('text', { x: cx, y: Y(0) + 48, 'text-anchor': 'middle' }, svg, 'p ' + Math.round(q.p * 100) + '%');
+      S('text', { x: cx, y: Y(0) + 61, 'text-anchor': 'middle' }, svg, q.T + ' tok');
+    } else {
+      S('text', { x: cx, y: Y(0) + 50, 'text-anchor': 'middle' }, svg, 'p = ' + Math.round(q.p * 100) + '% · ' + q.T + ' tokens');
+    }
+  });
+  document.getElementById('lg-target').style.visibility = state.mode === 'wf' ? 'visible' : 'hidden';
+  var nw = noise(wf.K), nu = noise(un.K), n0 = noise(PROMPTS.map(function (q) { return q.K0; }));
+  document.getElementById('readout').innerHTML = state.budget === 0
+    ? 'With no budget, every prompt trains on its probe pairs only. Total noise: <b>' + fmt(n0) + '</b> (relative units).'
+    : 'Total noise: Neyman allocation <b>' + fmt(nw) + '</b>, same rollouts for every prompt <b>' + fmt(nu) + '</b>, so Neyman allocation leaves <b>' +
+      Math.round((1 - nw / nu) * 100) + '%</b> less. Probe pairs alone: ' + fmt(n0) + '.';
+  var h = Math.ceil(document.body.getBoundingClientRect().height) + 2;
+  if (window.parent && window.parent !== window) window.parent.postMessage({ type: 'anim-height', h: h }, '*');
+}
+document.getElementById('budget').addEventListener('input', function (e) { state.budget = +e.target.value; render(); });
+document.querySelectorAll('.seg button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    state.mode = b.getAttribute('data-mode');
+    document.querySelectorAll('.seg button').forEach(function (o) { o.classList.toggle('on', o === b); });
+    render();
+  });
+});
+var rt; window.addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(render, 60); });
+window.addEventListener('load', render);
+render();
+})();
+</script>
+</body>
+</html>
