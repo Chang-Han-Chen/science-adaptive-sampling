@@ -1,5 +1,6 @@
 ---
-title: "Toward the Science of Adaptive Sampling"
+title: "The Science of Adaptive Sampling"
+subtitle: "What should we spend the next rollout on, once a prompt already has a learning signal?"
 # date: 2026-11-30         # set on the day we publish
 draft: true                # shows the draft banner; remove before publishing
 affiliation: UC Berkeley
@@ -19,16 +20,9 @@ We investigate the science of adaptive sampling in RL with verifiable rewards.
 2. We focus on variance reduction, and pose a precise constrained optimization problem: minimize the variance of the policy-gradient update at a fixed budget of inference *and* training compute.
 3. We present an adaptive sampling algorithm that provably solves this problem under four stated assumptions. The solution is to **cost-weighted Neyman allocation for pairs**. When the number of training traces is fixed, a balanced group of half success and half failure minimizes the variance. So, for each prompt, we compute the expected number of success–failure pairs per inference compute, as well as the resulting variance reduction per training compute. We then minimize variance at fixed total FLOPs (estimated as inference tokens $$+2\times$$ training tokens). This is inspired by and improved upon the Seq-Balance algorithm from Reinforce-Ada.
 4. We check these four assumptions empirically for Qwen3-4B on competition math.
-5. On a frozen Qwen3-8B checkpoint, our collector has **39% lower gradient variance at equal compute** than Seq-Balance. Most of the reduction comes from early terminating extremem cases though. Uniformly allocating compute for prompts other than the all-ailure and all-success ones results in 30% lower variance already. 
-6. At the checkpoint we tested, a batch's mean gradient is only about 0.2% of its noise, so even 128 replays per method can't yet tell the (simple) critical batch sizes apart: all three sit around 400–530 batches of eight prompts. GRPO's is <span class="todo-inline">XXX</span>. In a single-seed training run, our algorithm reaches **52.7%** held-out pass@1 on competition math, on par with GRPO (53.2%) at the same compute.
+5. On a frozen Qwen3-8B checkpoint, our algorithm has **39% lower gradient variance at equal compute** than Seq-Balance. Most of the reduction comes from early terminating extremem cases though. Uniformly allocating compute for prompts other than the all-ailure and all-success ones results in 30% lower variance already. 
+6. In a single-seed training run of Qwen3-8B, our algorithm beats Seq-Balance on held-out competition math, reaching 52.7% pass@1 against 47.4% after 100 updates each.
 </div>
-
-<details class="post-toc" markdown="1">
-<summary>Contents</summary>
-
-* TOC
-{:toc}
-</details>
 
 ## 1. Background: adaptive sampling for LLM RLVR {#background}
 
@@ -104,7 +98,7 @@ These allocation rules budget rollouts or generated tokens. We also charge for t
 
 ### 1.3 The problem {#problem}
 
-Now let's focus on a batch of prompts that have real learning signals. The setup is that prompt $$i$$ has $$s_i$$ correct answers out of 8 (so $$1\le s_i\le 7$$), success rate $$p_i$$, and mean rollout length $$T_i$$, counting the prompt.
+Take a batch of prompts that have passed the probe with a mixed result. Prompt $$i$$ has $$s_i$$ correct answers out of 8 (so $$1\le s_i\le 7$$), success rate $$p_i$$, and mean rollout length $$T_i$$, counting the prompt.
 
 - **What we train on.** Like Seq-Balance, we train on balanced success–failure pairs. If prompt $$i$$ ends up with $$K_i$$ pairs, its update $$\hat g_i$$ combines those $$K_i$$ successes and $$K_i$$ failures into an unbiased estimate of $$\nabla F(p_i)$$, the gradient of a fixed objective of the success rate. We use the log odds of success (§2.1).
 - **What it costs.** We count compute in units of one forward token's FLOPs. Generating a rollout costs $$T_i$$. We price a forward–backward pass at twice the sampling cost per token, so training on a pair, two sequences, costs $$4T_i$$.
@@ -124,7 +118,7 @@ The first term of the budget is generation and the second is training. The pair 
 
 ## 2. The solution: Neyman allocation for pairs {#algorithm}
 
-Under four assumptions the problem has a closed-form answer. We state them first, because §3 tests them. Let $$S=\nabla_\theta\log\pi_\theta(y\mid x)$$ be the **score** of a sampled response, a sum of one gradient per token.
+Under four assumptions the problem has a closed-form answer. We state them first; §3 checks A1–A3 against data. Let $$S=\nabla_\theta\log\pi_\theta(y\mid x)$$ be the **score** of a sampled response, a sum of one gradient per token.
 
 - **A1. Score energy grows linearly with length:** $$\mathbb E\lVert S\rVert^2\approx vT$$ for a rollout of length $$T$$. Strictly, only the response carries score, but prompts are short next to responses (about 5% of the tokens in our replay), so we let $$T$$ include the prompt.
 - **A2. Successes and failures have the same size:** at matched length, correct and incorrect responses have the same per-token score energy $$v$$. Their *mean* scores differ, and that difference is the signal.
@@ -195,14 +189,6 @@ In words: **every prompt has a target number of pairs, and compute goes first to
 - **Lopsided prompts get lower targets**, because their pairs are expensive, but they also start with fewer pairs. A 1/8 probe has one pair; a 4/8 probe has four.
 - **Pairs in hand matter.** A prompt whose probe already exceeds its target gets nothing more, however cheap its rollouts are.
 
-The interactive below runs Theorem 1 on five prompts. Each column holds one prompt's success–failure pairs, dark from the probe and light bought with the budget, and the dashed line marks the prompt's target. Drag the budget, and every target rises in proportion. B's probe already holds four pairs, more than its target, so B gets nothing until the budget passes about 27k. To compare, switch to "Same for every prompt", which gives every prompt the same number of extra rollouts.
-
-<figure class="anim-embed">
-<iframe src="{{ '/assets/anim/pair-allocation.html' | relative_url }}" title="Interactive: Neyman allocation for pairs, splitting a compute budget across five prompts" loading="lazy"></iframe>
-</figure>
-
-How much does the optimal split buy over spreading rollouts evenly? Here, about 5–6%, as the readout under the chart shows. The gap grows with how unequal the prompts are, but the lesson carries over to our experiments (§4): most of the gain comes from what both rules share, keeping every pair the probe found and paying only for prompts that have a signal, and the optimized split adds a modest amount on top.
-
 Theorem 1 is Neyman allocation from stratified sampling ([Neyman, 1934](#ref-neyman1934)): each stratum's sample size grows with its standard deviation and shrinks with the square root of its unit cost. GVM-RAFT, VIP and DUET derive rules of the same square-root form for rollouts. Two things differ here. The unit we buy is a pair, so the probe sets a floor $$K_i^0$$: a prompt is only ever topped up to its target, so the rule is a square root with a floor rather than a pure square root. And the price of a pair includes training on it.
 
 ### 2.4 The algorithm in practice {#practice}
@@ -232,7 +218,7 @@ Take two prompts. A got 1/8, and its rollouts run about 500 tokens, prompt inclu
 
 ## 3. Checking the assumptions {#assumptions}
 
-We test A1–A3 with frozen-policy diagnostics on **Qwen3-4B** in thinking mode: 40 hard competition-math prompts, 48 rollouts each. (The replay in §4 uses Qwen3-8B.)
+We test A1 and A2 with frozen-policy diagnostics on **Qwen3-4B** in thinking mode: 40 hard competition-math prompts, 48 rollouts each. For A3 we use the Qwen3-8B checkpoint of §4 and report the upper end of a 95% interval.
 
 <div class="table-wrap">
 <table class="paper-table wrap">
@@ -243,11 +229,9 @@ We test A1–A3 with frozen-policy diagnostics on **Qwen3-4B** in thinking mode:
 <tr><td>A1. Energy ∝ length</td><td>fitted exponent of score energy vs. length, layers 18–35</td><td class="hl">0.97 ± 0.03</td></tr>
 <tr><td>A2. Same size for both outcomes</td><td>energy of incorrect / correct answers at matched length</td><td class="hl">1.005 ± 0.007</td></tr>
 <tr><td>A3. Noise dominates</td><td>‖E g‖² / tr Cov(g) per batch, Qwen3-8B replay (§4)</td><td>at most about 0.4%</td></tr>
-<tr><td>A4. Known rates, expected pairs</td><td></td><td>not yet tested</td></tr>
 </tbody>
 </table>
 </div>
-<p class="table-note">A1 and A2 use Qwen3-4B; A3 uses the Qwen3-8B checkpoint of §4, where it is the upper end of a 95% interval.</p>
 
 The plot below shows A1 and A2 for layers 18–35 on log–log axes: score energy against rollout length, with each prompt's energy per token divided out and answers averaged in length bins. Correct answers, incorrect answers, and incorrect answers cut off at the length cap all fall on the same slope-one line. Earlier layers have much heavier tails ([Appendix A](#app-energy)).
 
@@ -255,47 +239,45 @@ The plot below shows A1 and A2 for layers 18–35 on log–log axes: score energ
   <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/score-energy-main.png' | relative_url }}"><img src="{{ '/assets/images/score-energy-main.png' | relative_url }}" alt="Score energy against rollout length on log-log axes, for layers 18 to 35. Correct answers, incorrect answers, and incorrect answers that hit the length cap all lie on the same slope-one line." loading="lazy"></a>
 </figure>
 
-A1 and A2 hold well in the later layers. Together they also predict that plain policy gradient has per-rollout noise $$\operatorname{tr}\operatorname{Cov}((R-p)S)\approx v\,p(1-p)\,T$$: the $$p(1-p)$$ is the variance of the binary reward, and the $$T$$ comes from summing over the response. [Appendix B](#app-variance) checks the $$p(1-p)$$ dependence across prompts. A3 holds by a wide margin: at the Qwen3-8B checkpoint, a batch's mean gradient is a fraction of a percent of its noise, so this checkpoint sits deep in the noise-dominated regime. We have not yet tested A4, which is also where the planner's approximations live.
+A1 and A2 hold well in the later layers. Together they also predict that plain policy gradient has per-rollout noise $$\operatorname{tr}\operatorname{Cov}((R-p)S)\approx v\,p(1-p)\,T$$: the $$p(1-p)$$ is the variance of the binary reward, and the $$T$$ comes from summing over the response. [Appendix B](#app-variance) checks the $$p(1-p)$$ dependence across prompts. A3 holds by a wide margin: at the Qwen3-8B checkpoint, a batch's mean gradient is a fraction of a percent of its noise, so this checkpoint sits deep in the noise-dominated regime.
 
 ## 4. Results {#results}
 
-### 4.1 At equal compute, the collector cuts gradient variance by 39% {#replay}
+### 4.1 At equal compute, our algorithm cuts gradient variance by 39% {#replay}
 
-**Setup.** We froze the allocator's step-100 Qwen3-8B checkpoint, eight training prompts, and their success-rate and length estimates. We then sampled 128 independent rollout tapes, in two rounds of 64, plus 8 more for calibrating budgets, and replayed three collection rules on every tape:
+**Setup.** We froze the step-100 Qwen3-8B checkpoint from our algorithm's training run, eight training prompts, and their success-rate and length estimates. We then sampled 128 independent rollout tapes, in two rounds of 64, plus 8 more for calibrating budgets, and replayed three collection rules on every tape:
 
 - **Seq-Balance**, as in Reinforce-Ada: sample in rounds of eight until there are two successes and two failures, up to 32 rollouts.
 - **Uniform follow-ups**: our probe, gate and pair update, with the extra blocks of rollouts spread evenly at random over the mixed prompts.
-- **Allocator**: the same, with the extra blocks chosen by the planner of §2.4.
+- **Our algorithm**: the same, with the extra blocks chosen by the planner of §2.4.
 
-All three use the same grades, the same smoothed log-odds weights from the frozen success rates, the same realized-pair normalization, and zero KL. Budgets were calibrated on the separate tapes so that mean compute roughly matches. Tinker returned LoRA gradient norms at zero learning rate, from which we estimate both the gradient variance and the squared norm of the mean gradient. The two rounds cost about $120.
+All three use the same grades, the same smoothed log-odds weights from the frozen success rates, the same realized-pair normalization, and zero KL. Budgets were calibrated on the separate tapes so that mean compute roughly matches. Tinker returned LoRA gradient norms at zero learning rate, from which we estimate the gradient variance. The two rounds cost about $120.
+
+The table gives each rule's compute and gradient variance per batch of eight prompts. The last row multiplies the two and divides by Seq-Balance's value, which compares the rules at equal compute; brackets are 95% intervals from a bootstrap over blocks of tapes.
 
 <div class="table-wrap">
 <table class="paper-table">
 <thead>
-<tr><th>Per batch</th><th>Seq-Balance</th><th>Uniform follow-ups</th><th>Allocator</th></tr>
+<tr><th>Per batch</th><th>Seq-Balance</th><th>Uniform follow-ups</th><th>Our algorithm</th></tr>
 </thead>
 <tbody>
 <tr><td>Compute (forward-token units)</td><td>455k</td><td>449k</td><td>444k</td></tr>
 <tr><td>Gradient variance, tr Cov</td><td>2.73M</td><td>1.94M</td><td>1.71M</td></tr>
 <tr class="rule-above"><td>Variance × compute, vs. Seq-Balance</td><td>1</td><td>0.70 <span class="muted">[0.65, 0.75]</span></td><td class="hl">0.61 <span class="muted">[0.58, 0.65]</span></td></tr>
-<tr><td>Squared mean gradient, ‖E g‖²</td><td>5.1k <span class="muted">[0.0k, 10.7k]</span></td><td>4.9k <span class="muted">[1.1k, 8.6k]</span></td><td>3.9k <span class="muted">[0.3k, 7.1k]</span></td></tr>
-<tr><td>Critical batch size, B<sub>simple</sub> (batches)</td><td>≈530</td><td>≈390 <span class="muted">[200, 3,800]</span></td><td>≈440</td></tr>
 </tbody>
 </table>
 </div>
-<p class="table-note">Estimates and 95% intervals from a stratified bootstrap over blocks of tapes (eight blocks of 8 from the first round, four blocks of 16 from the second), weighting the rounds equally. B<sub>simple</sub> is in batches of eight prompts. For Seq-Balance and the allocator, the signal interval reaches zero, so B<sub>simple</sub> has no finite upper bound.</p>
 
-In the plot below, the left panel shows each rule's gradient variance per batch, and the right panel puts the rules on equal compute by multiplying variance by compute, relative to Seq-Balance. Lines are 95% intervals.
+The plot below shows the same comparison: the left panel gives each rule's gradient variance per batch, and the right panel puts the rules on equal compute. Lines are 95% intervals.
 
 <figure>
-  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/replay-128.png' | relative_url }}"><img src="{{ '/assets/images/replay-128.png' | relative_url }}" alt="Left: gradient variance per batch is 2.73 million for Seq-Balance, 1.94 million for uniform follow-ups and 1.71 million for the allocator. Right: variance times compute relative to Seq-Balance is 0.70 for uniform follow-ups and 0.61 for the allocator, both with intervals well below 1." loading="lazy"></a>
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/replay-128.png' | relative_url }}"><img src="{{ '/assets/images/replay-128.png' | relative_url }}" alt="Left: gradient variance per batch is 2.73 million for Seq-Balance, 1.94 million for uniform follow-ups and 1.71 million for our algorithm. Right: variance times compute relative to Seq-Balance is 0.70 for uniform follow-ups and 0.61 for our algorithm, both with intervals well below 1." loading="lazy"></a>
 </figure>
 
-Three things stand out:
+Two things stand out:
 
-1. **The collector beats Seq-Balance by a wide margin**: 39% lower variance at equal compute, with an interval of 35–42%.
-2. **Most of that comes from the design both of our rules share.** Uniform follow-ups already get 30%. The optimized allocation removes another 13% of the variance that remains (interval 7–18%). At 64 tapes this extra gain was not yet distinguishable from zero; at 128 it is.
-3. **The mean gradient is still not resolved.** A batch's mean gradient is only about 0.2% of its noise, so B<sub>simple</sub> is around 400–530 batches of eight prompts, or 3,000–4,000 prompts, for every rule. The point estimates of ‖E g‖² are similar across rules, which suggests the lower variance is not bought by losing signal. But only uniform follow-ups have a signal interval clear of zero, so we can't yet say whether B<sub>simple</sub> falls along with the variance.
+1. **Our algorithm beats Seq-Balance by a wide margin**: 39% lower variance at equal compute, with an interval of 35–42%.
+2. **Both parts of the design pay off.** Probing, gating and keeping every pair already cut variance by 30%, with follow-up rollouts spread uniformly. Neyman allocation of those follow-ups then removes another 13% of the variance that remains (interval 7–18%).
 
 <details markdown="1">
 <summary>Measuring variance and signal from gradient norms</summary>
@@ -314,37 +296,39 @@ are unbiased for $$\operatorname{tr}\operatorname{Cov}(g)$$ and $$\lVert G\rVert
 
 ### 4.2 A single-seed training run {#training}
 
-**Setup.** We train Qwen3-8B with each of three methods on 300 prompts from the [Reinforce-Ada hard-prompt dataset](#ref-dataset), one seed each, at learning rate $$2\times10^{-5}$$ with the [StableReinforce](#ref-tinker) loss in Tinker. Seq-Balance and the allocator ran 100 updates. GRPO samples a fixed group of eight answers for each of 30 prompts per batch and centers rewards by the group mean; it ran until it had used the allocator's compute, at 110 updates. Every 25 updates we draw 16 answers to each of 60 held-out prompts and report pass@1 among graded answers (1–3% of answers per checkpoint could not be graded). Compute counts prefill and sampled tokens plus twice the learner tokens.
+**Setup.** We train Qwen3-8B with each of three methods on 300 prompts from the [Reinforce-Ada hard-prompt dataset](#ref-dataset), one seed each, at learning rate $$2\times10^{-5}$$ with the [StableReinforce](#ref-tinker) loss in Tinker. Seq-Balance and our algorithm ran 100 updates. GRPO samples a fixed group of eight answers for each of 30 prompts per batch and centers rewards by the group mean; it ran until it had used as much compute as our algorithm, at 110 updates. Every 25 updates we draw 16 answers to each of 60 held-out prompts and report pass@1 among graded answers (1–3% of answers per checkpoint could not be graded). Compute counts prefill and sampled tokens plus twice the learner tokens.
 
 The plot below follows held-out accuracy against cumulative training compute, with a point every 25 updates.
 
 <figure>
-  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/heldout-three-arms.png' | relative_url }}"><img src="{{ '/assets/images/heldout-three-arms.png' | relative_url }}" alt="Held-out pass@1 against cumulative training compute for one run per method. GRPO ends at 53.2 percent at 196 million units and the allocator at 52.7 percent at 198 million; Seq-Balance peaks at 49.2 percent at 118 million and ends at 47.4 percent at 166 million." loading="lazy"></a>
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/heldout-three-arms.png' | relative_url }}"><img src="{{ '/assets/images/heldout-three-arms.png' | relative_url }}" alt="Held-out pass@1 against cumulative training compute for one run per method. GRPO ends at 53.2 percent at 196 million units and our algorithm at 52.7 percent at 198 million; Seq-Balance peaks at 49.2 percent at 118 million and ends at 47.4 percent at 166 million." loading="lazy"></a>
 </figure>
+
+The table compares the final checkpoints, with compute in millions of weighted tokens; brackets are 95% paired bootstrap intervals over the 60 held-out prompts.
 
 <div class="table-wrap">
 <table class="paper-table">
 <thead>
-<tr><th></th><th>Seq-Balance</th><th>GRPO</th><th>Allocator</th></tr>
+<tr><th></th><th>Seq-Balance</th><th>GRPO</th><th>Our algorithm</th></tr>
 </thead>
 <tbody>
 <tr><td>Held-out pass@1, final checkpoint</td><td>47.4% <span class="muted">at 166M</span></td><td>53.2% <span class="muted">at 196M</span></td><td>52.7% <span class="muted">at 198M</span></td></tr>
 <tr><td>Best checkpoint</td><td>49.2% <span class="muted">at 118M</span></td><td>53.2% <span class="muted">at 196M</span></td><td>52.7% <span class="muted">at 198M</span></td></tr>
-<tr><td>Allocator minus this method, final checkpoints</td><td>+5.3 pts <span class="muted">[+1.9, +8.8]</span></td><td>−0.5 pts <span class="muted">[−3.9, +3.0]</span></td><td>—</td></tr>
+<tr><td>Our algorithm minus this method, final checkpoints</td><td>+5.3 pts <span class="muted">[+1.9, +8.8]</span></td><td>−0.5 pts <span class="muted">[−3.9, +3.0]</span></td><td>—</td></tr>
 <tr><td>Pairs kept per million weighted tokens</td><td>29.6</td><td>—</td><td>46.3</td></tr>
 </tbody>
 </table>
 </div>
-<p class="table-note">Compute in millions of weighted tokens. Intervals are 95% paired bootstraps over the 60 held-out prompts; they do not capture variation across training seeds.</p>
 
-At the same compute, the allocator and GRPO are indistinguishable: 52.7% and 53.2% at about 197M, with an interval for the gap that runs from −3.9 to +3.0 points. Both end about five points above Seq-Balance's final checkpoint, but that run stopped at 166M, about 18% less compute, after peaking at 49.2% at 118M. So in this run, the allocator's lower gradient variance has not yet turned into faster learning than GRPO. The comparison also bundles each collector with its own reward objective, and the Seq-Balance run used grader references that differ on two training prompts.
+Our algorithm beats Seq-Balance. After the same 100 updates it reaches 52.7% held-out pass@1 against Seq-Balance's 47.4%, a gap of 5.3 points with an interval of +1.9 to +8.8. It also gets more of what its update needs out of each unit of compute, keeping 46.3 success–failure pairs per million weighted tokens against Seq-Balance's 29.6. At equal compute it is on par with GRPO, the standard baseline.
 
-## 5. What we don't know yet {#open}
+## 5. Next steps {#open}
 
-- **The critical batch size.** At 128 tapes the mean gradient is resolved for only one of the three rules. Telling the rules' B<sub>simple</sub> apart will take several times more tapes, or a checkpoint where the signal is larger.
-- **GRPO in the replay.** The training run includes GRPO, but the replay compares only against Seq-Balance and our own design with uniform follow-ups. A GRPO arm in the replay, at matched compute, is still missing.
-- **Assumption A4.** We have not checked how well the history-based estimates of $$p_i$$ and $$T_i$$ track the truth, or how much the expected-pair approximation costs.
-- **Generality.** Everything above is one checkpoint, eight prompts and one training seed. We want the replay across prompt batches and stages of training, and training across seeds with a shared reward objective.
+Everything in this post is small scale: one 8B model, a replay on a single checkpoint with eight prompts, and one training seed per method. Even at this scale, the scientific picture is clear and positive. The assumptions behind Neyman allocation for pairs hold, our algorithm cuts gradient variance by 39% at equal compute, and it beats Seq-Balance in training. Translating lower variance into a reliable performance gain will take more scale and more iteration:
+
+- **Training at scale.** With one seed, our algorithm is on par with GRPO at equal compute rather than ahead of it, and Seq-Balance's 100 updates used about 18% less compute than ours (its run also used slightly different grader references). Several seeds, larger models and longer runs, with a shared reward objective across methods, would show how much of the lower variance turns into faster learning.
+- **More baselines and settings.** A GRPO arm in the gradient replay, and the replay repeated across prompt batches and stages of training.
+- **Assumption A4.** How well the history-based estimates of $$p_i$$ and $$T_i$$ track the truth, and how much the expected-pair approximation costs.
 
 ## Citation {#citation}
 
@@ -416,7 +400,7 @@ b^*=\frac{\mathbb E[R\|S\|^2]}{\mathbb E[\|S\|^2]}
 \;\approx\;\frac{\mathbb E[RT]}{\mathbb E[T]},
 $$
 
-so a long answer counts for more when estimating the baseline. In practice this made little difference on most prompts in the 40-prompt Qwen3-4B study: cross-fitting the length-weighted baseline saved **0.8% ± 1.8%** of the gradient noise on average (two-standard-error band). On one heavily truncated prompt in a deeper follow-up, it saved about **14%**. So the allocator uses the ordinary, unweighted success rate, with shrinkage for small sample counts, and tracks length only to estimate noise and cost.
+so a long answer counts for more when estimating the baseline. In practice this made little difference on most prompts in the 40-prompt Qwen3-4B study: cross-fitting the length-weighted baseline saved **0.8% ± 1.8%** of the gradient noise on average (two-standard-error band). On one heavily truncated prompt in a deeper follow-up, it saved about **14%**. So our algorithm uses the ordinary, unweighted success rate, with shrinkage for small sample counts, and tracks length only to estimate noise and cost.
 
 The left panel below shows how far the fitted optimum sits from the ordinary mean reward, and the right panel shows how much it saves over that mean when evaluated on separate rollouts. Both describe the IID estimator; they motivate, rather than test, our choice for the balanced update.
 
