@@ -1,5 +1,5 @@
 ---
-title: "The Science of Adaptive Sampling"
+title: "Some Empirical Science on Adaptive Sampling"
 subtitle: "What should we spend the next rollout on, once a prompt already has a learning signal?"
 # date: 2026-11-30         # set on the day we publish
 draft: true                # shows the draft banner; remove before publishing
@@ -17,9 +17,9 @@ excerpt: "We sort adaptive sampling for RLVR into signal seeking and variance re
 We investigate the science of adaptive sampling in RL with verifiable rewards.
 
 1. We survey the past literature and identify two distinct focuses: **signal seeking**, which aims to get the first success on a hard task, and **variance reduction**, which aims to reduce the noise when mean gradient is non-zero.
-2. We focus on variance reduction, and pose a precise constrained optimization problem: minimize the variance of the policy-gradient update at a fixed budget of inference *and* training compute.
-3. We present an adaptive sampling algorithm that provably solves this problem under four stated assumptions. The solution is to **cost-weighted Neyman allocation for pairs**. When the number of training traces is fixed, a balanced group of half success and half failure minimizes the variance. So, for each prompt, we compute the expected number of success–failure pairs per inference compute, as well as the resulting variance reduction per training compute. We then minimize variance at fixed total FLOPs (estimated as inference tokens $$+2\times$$ training tokens). This is inspired by and improved upon the Seq-Balance algorithm from Reinforce-Ada.
-4. We check these four assumptions empirically for Qwen3-4B on competition math.
+2. We pose rollout allocation as a stochastic optimization problem. We minimize gradient variance under one expected compute budget for inference and training.
+3. We train on balanced success–failure pairs, following Seq-Balance. The planner uses the expected pair yield to choose how many rollouts to generate for each prompt. At a constant marginal cost per pair, the allocation reduces to **cost-weighted Neyman allocation**. After grading, we train on every pair we can form.
+4. We check the score variance model on competition-math rollouts from Qwen3-4B and a Qwen3-8B checkpoint.
 5. On a frozen Qwen3-8B checkpoint, our algorithm has **39% lower gradient variance at equal compute** than Seq-Balance. Most of the reduction comes from early terminating extremem cases though. Uniformly allocating compute for prompts other than the all-ailure and all-success ones results in 30% lower variance already. 
 6. In a single-seed training run of Qwen3-8B, our algorithm beats Seq-Balance on held-out competition math, reaching 52.7% pass@1 against 47.4% after 100 updates each.
 </div>
@@ -54,7 +54,7 @@ As we will explain later, we chose an objective that has higher variance on ques
 
 
 We find that this perspective provides a nice dicatomy on the past literature
-### 1.1 Signal Seeking
+### 1.1 From $$0$$ to $$1$$: Signal Seeking
 
 This is what a prompt _without_ signal looks like. Here are four answers from a Qwen3-8B checkpoint 75 steps into RL training, each cut to its last few lines:
 
@@ -74,7 +74,7 @@ Most work on adaptive sampling so far is about prompts like this one, and its si
 
 We think much of signal seeking is better handled one level up, by designing environments and curricula that keep the model near the edge of what it can solve. How to find that edge automatically is a topic for another post.
 
-### 1.2 Variance Reduction {#sharpen}
+### 1.2 From $$1$$ success to More: Variance Reduction {#sharpen}
 
 Now take a prompt the model sometimes gets right. The same checkpoint answers another competition problem four times, and one answer is correct:
 
@@ -96,34 +96,43 @@ Prior work has asked this question too. GVM-RAFT made the case for allocating sa
 
 These allocation rules budget rollouts or generated tokens. We also charge for training on the responses we keep, and we buy *pairs*, the unit a balanced update actually uses.
 
-### 1.3 The problem {#problem}
+### 1.3 The problem we solved {#problem}
+
+For this project, we focused on the second question, namely the **variance reduction** when non-zero mean gradient is guranteed. As we will explain in great details later, at the start of each batch, our algorithm will sample $$8$$ rollouts for every prompt (the "probe" period). If any of the prompts score either $$0/8$$ or $$8/8$$, we give them up in this batch and only allocate the rest of compute for the other prompts. This way, the adaptive sampling becomes exactly the stochastic programming problem we now explain.
 
 Take a batch of prompts that have passed the probe with a mixed result. Prompt $$i$$ has $$s_i$$ correct answers out of 8 (so $$1\le s_i\le 7$$), success rate $$p_i$$, and mean rollout length $$T_i$$, counting the prompt.
 
-- **What we train on.** Like Seq-Balance, we train on balanced success–failure pairs. If prompt $$i$$ ends up with $$K_i$$ pairs, its update $$\hat g_i$$ combines those $$K_i$$ successes and $$K_i$$ failures into an unbiased estimate of $$\nabla F(p_i)$$, the gradient of a fixed objective of the success rate. We use the log odds of success (§2.1).
+- **What we train on.** Like Seq-Balance, we train on balanced success–failure pairs. We use all pairs that can be formed from the probe and follow-up responses. The weights in §2.2 give the update $$\hat g_i$$ the same mean $$\nabla F(p_i)$$ for every realized pair count. We use the log odds of success (§2.1).
 - **What it costs.** We count compute in units of one forward token's FLOPs. Generating a rollout costs $$T_i$$. We price a forward–backward pass at twice the sampling cost per token, so training on a pair, two sequences, costs $$4T_i$$.
 
 <div class="problem" markdown="1">
-**Problem (variance-optimal sampling at fixed compute).** Choose a number of extra rollouts $$n_i\ge 0$$ for each prompt, and an unbiased update $$\hat g_i$$ from the $$K_i$$ pairs they produce, to
+**Problem (rollout allocation under an expected compute budget).**
+
+Suppose a batch of $$B$$ prompts with success rates $$\{p_i\}$$ and expected length $$\{T_i\}$$ where $$i$$ runs from $$1$$ to $$B$$. They already have $$\{s_i\}$$ successful rollouts, and it is guaranteed that $$1\leq s_i \leq 7$$ due to the probe period.
+
+If we generate $$n_i$$ independent follow-up rollouts, then $$X_i\sim\operatorname{Binomial}(n_i,p_i)$$ of them succeed. The pooled responses give $$K_i(n_i)=\min(s_i+X_i,\,8-s_i+n_i-X_i)$$ pairs. Let $$C$$ be the batch's expected compute budget and $$C_{\mathrm{probe}}$$ the compute spent generating the probes. The remaining budget $$C_{\mathrm{rem}}=C-C_{\mathrm{probe}}$$ covers follow-up generation and training on the pooled pairs. Conditional on the probe grades, we solve
 
 $$
-\min_{n,\ \hat g}\ \operatorname{tr}\operatorname{Cov}\Big(\sum_i \hat g_i\Big)
-\qquad\text{subject to}\qquad
-\sum_i T_i\,\big(n_i + 4K_i\big)\;\le\; C .
+\begin{aligned}
+\min_{n_1,\ldots,n_B\in\mathbb Z_{\ge 0}}\quad
+  & \operatorname{tr}\operatorname{Cov}\Big(\sum_{i=1}^{B}\hat g_i(n_i)\Big) \\
+\text{subject to}\quad
+  & \mathbb E\Big[\sum_{i=1}^{B}T_i\big(n_i+4K_i(n_i)\big)\Big]\le C_{\mathrm{rem}} .
+\end{aligned}
 $$
 
 </div>
 
-The first term of the budget is generation and the second is training. The pair count $$K_i$$ depends on how the rollouts come out; assumption A4 below replaces it by its expected value. Because the target $$\sum_i\nabla F(p_i)$$ does not depend on how we sample, minimizing the variance is the same as minimizing the simple critical batch size $$B_{\text{simple}}=\operatorname{tr}\operatorname{Cov}(\hat g)/\lVert\mathbb E\,\hat g\rVert^2$$ of [McCandlish et al. (2018)](#ref-mccandlish2018), the batch size beyond which larger batches stop paying for themselves.
+For a fixed, nonzero target $$\sum_i\nabla F(p_i)$$, minimizing the variance also minimizes the simple critical batch size $$B_{\text{simple}}=\operatorname{tr}\operatorname{Cov}(\hat g)/\lVert\mathbb E\,\hat g\rVert^2$$ of [McCandlish et al. (2018)](#ref-mccandlish2018), the batch size beyond which larger batches stop paying for themselves.
 
 ## 2. The solution: Neyman allocation for pairs {#algorithm}
 
-Under four assumptions the problem has a closed-form answer. We state them first; §3 checks A1–A3 against data. Let $$S=\nabla_\theta\log\pi_\theta(y\mid x)$$ be the **score** of a sampled response, a sum of one gradient per token.
+We first derive the variance of a balanced update at a given pair count, then use it to allocate compute. Section 3 checks A1–A3 against data. Let $$S=\nabla_\theta\log\pi_\theta(y\mid x)$$ be the **score** of a sampled response, a sum of one gradient per token.
 
 - **A1. Score energy grows linearly with length:** $$\mathbb E\lVert S\rVert^2\approx vT$$ for a rollout of length $$T$$. Strictly, only the response carries score, but prompts are short next to responses (about 5% of the tokens in our replay), so we let $$T$$ include the prompt.
 - **A2. Successes and failures have the same size:** at matched length, correct and incorrect responses have the same per-token score energy $$v$$. Their *mean* scores differ, and that difference is the signal.
 - **A3. Noise dominates, and rollouts are independent:** rollouts are i.i.d. given the prompt, prompts are independent, and a response's mean score is small next to its spread, so second moments stand in for covariances.
-- **A4. Known rates, expected pairs:** $$p_i$$ and $$T_i$$ are known (in practice, estimated from the prompt's history), and the pair count $$K_i$$ is replaced by its expected value.
+- **A4. Planning with expected pair counts.** We treat $$p_i$$ and $$T_i$$ as known and use the expected pair count in the planner. In practice we estimate the rates and lengths from the prompt's history.
 
 ### 2.1 The objective: log odds, to run the last mile {#objective}
 
@@ -164,24 +173,39 @@ Seq-Balance is already close to this update. For one success and one failure, it
 
 ### 2.3 Splitting the budget {#allocation}
 
-Now the allocation. Prompt $$i$$ starts with $$K_i^0=\min(s_i,\,8-s_i)$$ pairs from its probe. Each extra pair needs about $$1/q_i$$ more rollouts, with $$q_i=\min(p_i,1-p_i)$$, plus training on two more responses, so it costs
+By Proposition 1 and independence across prompts, the covariance trace conditional on the pair counts is $$\sum_i a_i/K_i(n_i)$$. The conditional mean is constant, so the objective in §1.3 is the expectation of this sum. Write $$\bar K_i(n_i)=\mathbb E[K_i(n_i)]$$. The planner uses $$\bar K_i(n_i)$$ for the expected training cost and approximates $$\mathbb E[1/K_i(n_i)]$$ by $$1/\bar K_i(n_i)$$ in the variance objective.
+
+A linear approximation to the expected pair yield gives a closed-form allocation. Prompt $$i$$ starts with $$K_i^0=\min(s_i,\,8-s_i)$$ pairs. Once the rarer outcome limits pair formation, each extra pair takes about $$1/q_i$$ rollouts, where $$q_i=\min(p_i,1-p_i)$$. Approximate the expected yield by $$\bar K_i(n_i)\approx K_i^0+q_i n_i$$. Including training on both responses, the modeled marginal cost of a pair is
 
 $$
 c_i=T_i\Big(\frac{1}{q_i}+4\Big).
 $$
 
+Reserve $$4\sum_i T_i K_i^0$$ to train on the probe pairs. The available budget for additional pairs is $$C_{\mathrm{extra}}=C_{\mathrm{rem}}-4\sum_i T_i K_i^0$$. Keeping all probe pairs requires $$C_{\mathrm{extra}}\ge 0$$.
+
 <div class="theorem" markdown="1">
-**Theorem 1 (Neyman allocation for pairs).** Under A1–A4, with a constant price $$c_i$$ per extra pair, the solution of the problem in §1.3 gives prompt $$i$$
+**Theorem 1 (Neyman allocation for pairs).** For each prompt, let $$K_i^0>0$$ be the initial pair count and $$c_i>0$$ the cost per additional pair. The modeled variance at target count $$k_i$$ is $$a_i/k_i$$, with $$a_i>0$$. For a budget $$C_{\mathrm{extra}}\ge 0$$, the continuous problem
+
+$$
+\begin{aligned}
+\min_{k_i\ge K_i^0}\quad & \sum_i \frac{a_i}{k_i} \\
+\text{subject to}\quad & \sum_i c_i(k_i-K_i^0)\le C_{\mathrm{extra}}
+\end{aligned}
+$$
+
+has solution
 
 $$
 K_i^\star=\max\!\Big(K_i^0,\ \theta\sqrt{a_i/c_i}\Big)
 $$
 
-pairs, where $$\theta$$ is the unique level at which the budget is spent: $$\sum_i c_i\,(K_i^\star-K_i^0)=C$$. Equivalently, every prompt that gets extra rollouts ends with the same noise removed per FLOP, $$a_i/(c_iK_i^2)=1/\theta^2$$, and every prompt that gets none is already past that point.
+where $$\theta$$ is the unique level satisfying $$\sum_i c_i\,(K_i^\star-K_i^0)=C_{\mathrm{extra}}$$ when $$C_{\mathrm{extra}}>0$$. If $$C_{\mathrm{extra}}=0$$, the solution is $$K_i^\star=K_i^0$$ for every prompt.
 
 </div>
 
-<p class="proof" markdown="1">*Proof.* By Proposition 1 and independence across prompts, the variance of $$\sum_i\hat g_i$$ is $$\sum_i a_i/K_i$$. So we minimize $$\sum_i a_i/K_i$$ over $$K_i\ge K_i^0$$ subject to $$\sum_i c_i(K_i-K_i^0)\le C$$. The objective is strictly convex and decreasing in each $$K_i$$, and the constraints are linear, so the budget binds and the KKT conditions are necessary and sufficient: $$a_i/K_i^2=\lambda c_i-\mu_i$$ with $$\mu_i\ge 0$$ and $$\mu_i(K_i-K_i^0)=0$$. If $$K_i>K_i^0$$, then $$\mu_i=0$$ and $$K_i=\sqrt{a_i/(\lambda c_i)}$$. If $$K_i=K_i^0$$, then $$a_i/(K_i^0)^2\le\lambda c_i$$, i.e. $$K_i^0\ge\sqrt{a_i/(\lambda c_i)}$$. Both cases read $$K_i=\max(K_i^0,\theta\sqrt{a_i/c_i})$$ with $$\theta=\lambda^{-1/2}$$. The spend $$\sum_i c_i(K_i^\star-K_i^0)$$ is continuous and strictly increasing in $$\theta$$ once it is positive, so $$\theta$$ is unique. <span class="qed">∎</span></p>
+<p class="proof" markdown="1">*Proof.* At zero budget, only the initial counts are feasible. At positive budget, the objective is strictly convex and decreasing in each $$k_i$$, so the budget binds. If $$\eta$$ is its multiplier, the KKT conditions give $$a_i/k_i^2=\eta c_i$$ above the floor and $$a_i/(K_i^0)^2\le\eta c_i$$ at the floor. Both cases are captured by $$k_i=\max(K_i^0,\eta^{-1/2}\sqrt{a_i/c_i})$$. Spending is continuous and strictly increasing in $$\theta=\eta^{-1/2}$$ once it is positive, which gives a unique level. <span class="qed">∎</span></p>
+
+The corresponding rollout allocation is $$n_i^\star=(K_i^\star-K_i^0)/q_i$$. Every prompt assigned extra rollouts ends at the same marginal variance reduction per FLOP, $$a_i/(c_i(K_i^\star)^2)=1/\theta^2$$.
 
 In words: **every prompt has a target number of pairs, and compute goes first to the prompts furthest below their targets.** Raising the budget raises every target in proportion. Three consequences:
 
@@ -195,7 +219,7 @@ Theorem 1 is Neyman allocation from stratified sampling ([Neyman, 1934](#ref-ney
 
 1. **Probe.** Every prompt visit starts with eight rollouts. We estimate $$p_i$$ from the probe and the prompt's decayed past reward counts, with Beta(1,1) smoothing, and estimate $$T_i$$ from the same history.
 2. **Gate.** A prompt whose probe is all right or all wrong gets no extra rollouts on this visit; it is a signal-seeking problem. The gate gives up some learning: a prompt with a true 10% success rate still produces eight failures about 43% of the time.
-3. **Allocate.** For each mixed prompt we consider $$n\in\{0,8,16,24\}$$ extra rollouts and compute the expected pair count $$\mathbb E[K]$$ exactly from the binomial distribution. A small dynamic program then minimizes $$\sum_i T_i\,w_\lambda(p_i)^2/(D(p_i)\,\mathbb E[K_i])$$ subject to $$\sum_i T_i(n_i+4\,\mathbb E[K_i])\le C$$. This is the problem of §1.3 under A1–A4 in blocks of eight, which the dynamic program solves exactly; Theorem 1 is its continuous limit. (Our code counts only response tokens in the noise term, which slightly lowers the target of a prompt with a long prompt text.)
+3. **Allocate.** For each mixed prompt we consider $$n_i\in\{0,8,16,24\}$$ extra rollouts and compute $$\bar K_i(n_i)$$ from the binomial distribution. A small dynamic program minimizes $$\sum_i a_i/\bar K_i(n_i)$$ subject to the expected compute budget on a discretized cost grid. (Our code counts only response tokens in the noise term, which slightly lowers the target of a prompt with a long prompt text.)
 4. **Update.** We keep every balanced pair the pooled answers provide and apply the weights of Proposition 1. For a response with reward $$r$$ in a group with $$k$$ actual pairs, the per-token advantage is
    $$
    A(r)=\frac{4}{2k}\,\frac{w_\lambda(p)}{D(p)}\,(r-p),
@@ -205,7 +229,7 @@ Theorem 1 is Neyman allocation from stratified sampling ([Neyman, 1934](#ref-ney
 <details markdown="1">
 <summary>What the planner leaves out</summary>
 
-Plugging the expected pair count into the $$1/K$$ law (A4) is optimistic: the exact calculation would use $$\mathbb E[1/K]$$, which is larger when pair counts vary. The planner also ignores how the gate changes the mean and variance of a prompt's contribution when it sometimes drops the prompt. And realized lengths and pair counts can push a batch above or below the planned budget, so we compare methods by cumulative compute, including discarded rollouts.
+The follow-up planner conditions on mixed probes. Across all prompt visits, the gate can change the mean and variance of the update by dropping prompts with one-sided probes. Realized lengths and pair counts can also push a batch above or below its expected budget, so we compare methods by cumulative compute, including discarded rollouts.
 
 </details>
 
