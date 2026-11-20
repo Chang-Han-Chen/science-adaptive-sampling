@@ -1,316 +1,382 @@
 ---
-title: "Some Empirical Science on Adaptive Sampling"
-subtitle: "What should we spend the next rollout on, once a prompt already has a learning signal?"
+title: "How to think about compute‑optimal adaptive sampling?"
 # date: 2026-11-30         # set on the day we publish
 draft: true                # shows the draft banner; remove before publishing
 affiliation: UC Berkeley
 authors:
   - name: Chang-Han Chen
     url: https://chang-han-chen.github.io/
-excerpt: "We sort adaptive sampling for RLVR into signal seeking and variance reduction, pose variance reduction as an optimization problem at fixed inference and training compute, and solve it with Neyman allocation for pairs."
+excerpt: "When is adaptive sampling about variance reduction? Can we solve it as a stochastic optimization under (training+inference) compute constraint?"
 ---
 
 
 <div class="notice--info" markdown="1">
 **TL;DR**
 
-We investigate the science of adaptive sampling in RL with verifiable rewards.
+We investigate adaptive sampling in RL with verifiable rewards.
 
-1. We survey the past literature and identify two distinct focuses: **signal seeking**, which aims to get the first success on a hard task, and **variance reduction**, which aims to reduce the noise when mean gradient is non-zero.
-2. We pose rollout allocation as a stochastic optimization problem. We minimize gradient variance under one expected compute budget for inference and training.
-3. We train on balanced success–failure pairs, following Seq-Balance. The planner uses the expected pair yield to choose how many rollouts to generate for each prompt. At a constant marginal cost per pair, the allocation reduces to **cost-weighted Neyman allocation**. After grading, we train on every pair we can form.
-4. We check the score variance model on competition-math rollouts from Qwen3-4B and a Qwen3-8B checkpoint.
-5. On a frozen Qwen3-8B checkpoint, our algorithm has **39% lower gradient variance at equal compute** than Seq-Balance. Most of the reduction comes from early terminating extremem cases though. Uniformly allocating compute for prompts other than the all-ailure and all-success ones results in 30% lower variance already. 
-6. In a single-seed training run of Qwen3-8B, our algorithm beats Seq-Balance on held-out competition math, reaching 52.7% pass@1 against 47.4% after 100 updates each.
+1. We survey the past literature and identify two distinct focuses: **signal seeking**, which aims to get the first success on a hard prompt, and **variance reduction**, which aims to reduce the noise once the mean gradient is non-zero.
+2. We pose variance reduction as a stochastic optimization problem: how many more rollouts $$n_i$$ to sample for each prompt $$i$$, and how many successes $$S_i$$ and failures $$F_i$$ to train on. Schematically,
+
+   $$
+   \begin{aligned}
+   \{n_i,S_i,F_i\}={}&\arg\min\ \operatorname{Var}(\text{batch gradient})\\
+   &\text{s.t.}\ \mathbb E\big[\text{inference tokens} + 2 \times \text{training tokens}\big]\le C.
+   \end{aligned}
+   $$
+
+   Of course, how many successes and failures we get depends on how the extra rollouts come out, so the plan covers every possible outcome, and we count tokens in expectation.
+3. We solve it exactly, with a small mixed-integer program. The accuracy gradient points from the average failure to the average success, so we need both, and the rarer outcome is the bottleneck. The optimal plan is **Neyman allocation over (prompt, outcome) pairs**: each prompt aims for about as many successes as failures, whatever their lengths, and buys more rollouts only while the outcome it is short of is worth the price. We also prove that the resulting update always points along the accuracy gradient.
+4. We empirically check the noise model behind this on competition-math rollouts from Qwen3-4B.
+5. On a frozen Qwen3-8B checkpoint, our algorithm's gradient has **17% less variance than GRPO-8's at equal compute**.
+6. In training on competition math, our algorithm is **6.4 points ahead of GRPO-8 in held-out accuracy at equal training compute**, and matches it at equal total compute (53.7% vs 53.2%).
 </div>
 
 ## 1. Background: adaptive sampling for LLM RLVR {#background}
 
-Reinforcement learning with verifiable rewards (RLVR) ([Lambert et al., 2024](#ref-lambert2024)) unlocks the reasoning capabilities of large language models (LLM) ([OpenAI, 2024](#ref-openai2024); [DeepSeek-AI, 2025](#ref-deepseek2025)). The algorithm is remarkably simple and intuitive: sample a group of answers to each prompt, a verifier marks each one right or wrong, and the algorithm pushes the correct responses to be more likely and penalizes the wrong one. This is essentially the simples RL algorithm, called REINFORCE ([Williams, 1992](#ref-williams1992)),
+Reinforcement learning with verifiable rewards (RLVR) ([Lambert et al., 2024](#ref-lambert2024)) unlocks the reasoning capabilities of large language models (LLMs) ([OpenAI, 2024](#ref-openai2024); [DeepSeek-AI, 2025](#ref-deepseek2025)). The algorithm is remarkably simple and intuitive: sample a group of answers to each prompt, let a verifier mark each one right or wrong, and make the right answers more likely and the wrong ones less likely. This is essentially the simplest RL algorithm, REINFORCE ([Williams, 1992](#ref-williams1992)),
 
-$$ \nabla J(\theta) = \mathbb{E}_{x\sim \pi_\theta}[ R(x) \nabla \log \pi_\theta(x)]$$
+$$
+\nabla J(\theta)=\mathbb E_{y\sim\pi_\theta}\big[R(y)\,\nabla\log\pi_\theta(y)\big],
+$$
 
-with reward being binary $$R\in\{0,1\}$$. 
+with a binary reward $$R\in\{0,1\}$$. For a single prompt, $$J$$ is just its success rate $$p$$.
 
-It is kind of mindblowing that, if you implement this with _extreme_ attention to details, it just works! Looking back to the major advances in RLVR in the last two years, the common theme seems to be removing as much **bias** as possible (from e.g. numerical rounding, length normalization) that stands in the way of learning signals. If you can do that for it, REINFORCE just wants to learn. 
+It is kind of mind-blowing that, if you implement this with _extreme_ attention to detail, it just works! Looking back at the major advances in RLVR over the last two years, the common theme seems to be removing as much **bias** as possible (from, e.g., numerical rounding or length normalization) that stands in the way of the learning signal. If you can do that, REINFORCE just wants to learn.
 
-To train the best model at the frontier scale, you need faith in the training algorithms and are willing to spend compute ($$\approx$$ money) for variance reduction. As in classic statistics, the variance of training signals goes down like the inverse of sample number $$B$$, 
+To train the best model at the frontier scale, you need faith in the training algorithm and a willingness to spend compute ($$\approx$$ money) on variance reduction. As in classic statistics, the variance of the training signal goes down like the inverse of the number of samples $$B$$,
 
-$$\operatorname{Var} \sim \frac{1}{B}$$
+$$
+\operatorname{Var}\sim\frac{1}{B}.
+$$
 
 Frontier-scale RL runs use very large batches: the main RL run of Inkling 2 Small took 1,075 steps of 16K rollouts each, over 17 million rollouts in total on 2,048 GPUs ([Thinking Machines Lab, 2026](#ref-tml2026)).
 
-In addition, a common technique is _reward baseline_ $$b$$. The reward in REINFORCE is then replaced by the _advantage_, $$A(x) = R(x)-b$$. A simple and effective baseline is the group's mean 
+In addition, a common technique is a _reward baseline_ $$b$$. The reward in REINFORCE is then replaced by the _advantage_ $$A(y)=R(y)-b$$. A simple and effective baseline is the group's mean reward,
 
-$$b= \mathbb{E}[R]$$
+$$
+b=\mathbb E[R]=p,
+$$
 
-and is widely used in practice. When all the sample in a group gets the same reward, however, every advantage is zero and the prompt teaches the model nothing. There is no learning signal in this case.
+and it is widely used in practice. When all the answers in a group get the same reward, however, every advantage is zero and the prompt teaches the model nothing. There is no learning signal in this case.
 
 From this perspective, any RLVR sampling algorithm has two phases:
-1. **Signal seeking**: sample enough to get at least one success on as many questions of interest as possible
-2. **Variance reduction**: among the questions with at least one success, how should we allocate compute to reduce the batch gradient?
 
-As we will explain later, we chose an objective that has higher variance on questions that are very hard (but not impossible) or very easy (but not aced everytime). Our algorithm then decides how much more compute to spend on them. Notice that if a group has all success or failure, then it contributes **zero** to the variance instead of infinite. This is another way to see why signal seeking and variance reduction are two _separate_ algorithm considerations. 
+1. **Signal seeking:** sample enough to get at least one success on as many prompts of interest as possible.
+2. **Variance reduction:** among the prompts with at least one success, how should we allocate compute to reduce the variance of the batch gradient?
 
+The figure below follows one prompt through both phases. Each sketch shows how its gradient estimate varies from batch to batch, projected onto the direction of the true gradient, the direction that actually improves the model. The dashed line marks the true value.
 
-We find that this perspective provides a nice dicatomy on the past literature
-### 1.1 From $$0$$ to $$1$$: Signal Seeking
-
-This is what a prompt _without_ signal looks like. Here are four answers from a Qwen3-8B checkpoint 75 steps into RL training, each cut to its last few lines:
-
-<figure class="trace-fig">
-<div class="trace-card">
-  <div class="trace-prompt"><span class="lbl"><span>Prompt</span><span class="key">Correct answer: 55</span></span>A cube with a side of 5 is made up of 125 smaller cubes with a side of 1. How many small cubes does a plane perpendicular to one of the cube's diagonals and passing through its midpoint intersect?</div>
-  <div class="trace bad"><span class="n">1</span><span class="excerpt">… after researching similar problems, the correct number of cubes intersected by a plane perpendicular to a space diagonal through the center of a cube of side length n is 3n² − 3n + 1. For n = 5: 75 − 15 + 1 = 61</span><span class="ans">61 <span class="mark">✗</span><span class="tok">2,439 tokens</span></span></div>
-  <div class="trace bad"><span class="n">2</span><span class="excerpt">… Total number of cubes intersected = 6 + 10 + 15 = 31</span><span class="ans">31 <span class="mark">✗</span><span class="tok">1,649 tokens</span></span></div>
-  <div class="trace bad"><span class="n">3</span><span class="excerpt">… After verifying with known cases and research, the correct number of small cubes intersected … is 3n² − 3n + 1. For n = 5: 75 − 15 + 1 = 61</span><span class="ans">61 <span class="mark">✗</span><span class="tok">1,373 tokens</span></span></div>
-  <div class="trace bad"><span class="n">4</span><span class="excerpt">… which is known to be: for a cube of side length n (odd), the number is 3n² − 3n + 1. Thus, for n = 5 … 61</span><span class="ans">61 <span class="mark">✗</span><span class="tok">2,446 tokens</span></span></div>
+<figure class="phase-fig" aria-label="Three stages of a prompt's gradient. With zero successes in eight rollouts, the gradient estimate is exactly zero: zero mean and zero variance. Signal seeking leads to one success in eight, where the estimate has a tiny mean and a huge variance. Variance reduction leads to more rollouts at the same success rate, which keeps the mean and shrinks the variance.">
+<div class="pf-card">
+<div class="pf-title">0 of 8 succeed</div>
+<div class="pf-dots"><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span></div>
+<svg viewBox="0 0 200 72" aria-hidden="true"><line x1="50" y1="58" x2="50" y2="10" class="pf-curve" stroke-width="3" stroke-linecap="round"/><line x1="8" y1="58" x2="192" y2="58" class="pf-axis"/><line x1="50" y1="55" x2="50" y2="61" class="pf-axis"/><text x="50" y="70" class="pf-tick">0</text></svg>
+<div class="pf-sub"><span class="pf-hi">mean 0</span>, variance 0</div>
+</div>
+<div class="pf-arrow"><span>signal seeking</span><svg viewBox="0 0 72 14" aria-hidden="true"><line x1="2" y1="7" x2="66" y2="7"/><path d="M60 2 L68 7 L60 12" fill="none"/></svg></div>
+<div class="pf-card">
+<div class="pf-title">1 of 8 succeeds</div>
+<div class="pf-dots"><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot s"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span></div>
+<svg viewBox="0 0 200 72" aria-hidden="true"><line x1="76" y1="58" x2="76" y2="8" class="pf-mean"/><path d="M8.0 58.0 L8.0 54.5 L11.1 54.0 L14.1 53.5 L17.2 52.9 L20.3 52.3 L23.3 51.7 L26.4 51.0 L29.5 50.4 L32.5 49.7 L35.6 49.0 L38.7 48.3 L41.7 47.6 L44.8 46.9 L47.9 46.3 L50.9 45.7 L54.0 45.1 L57.1 44.6 L60.1 44.1 L63.2 43.7 L66.3 43.4 L69.3 43.2 L72.4 43.1 L75.5 43.0 L78.5 43.0 L81.6 43.1 L84.7 43.3 L87.7 43.6 L90.8 44.0 L93.9 44.4 L96.9 44.9 L100.0 45.5 L103.1 46.1 L106.1 46.7 L109.2 47.4 L112.3 48.1 L115.3 48.8 L118.4 49.4 L121.5 50.1 L124.5 50.8 L127.6 51.5 L130.7 52.1 L133.7 52.7 L136.8 53.3 L139.9 53.8 L142.9 54.3 L146.0 54.8 L149.1 55.2 L152.1 55.5 L155.2 55.9 L158.3 56.2 L161.3 56.5 L164.4 56.7 L167.5 56.9 L170.5 57.1 L173.6 57.2 L176.7 57.4 L179.7 57.5 L182.8 57.6 L185.9 57.7 L188.9 57.7 L192.0 57.8 L192.0 58.0 Z" class="pf-fill"/><path d="M8.0 54.5 L11.1 54.0 L14.1 53.5 L17.2 52.9 L20.3 52.3 L23.3 51.7 L26.4 51.0 L29.5 50.4 L32.5 49.7 L35.6 49.0 L38.7 48.3 L41.7 47.6 L44.8 46.9 L47.9 46.3 L50.9 45.7 L54.0 45.1 L57.1 44.6 L60.1 44.1 L63.2 43.7 L66.3 43.4 L69.3 43.2 L72.4 43.1 L75.5 43.0 L78.5 43.0 L81.6 43.1 L84.7 43.3 L87.7 43.6 L90.8 44.0 L93.9 44.4 L96.9 44.9 L100.0 45.5 L103.1 46.1 L106.1 46.7 L109.2 47.4 L112.3 48.1 L115.3 48.8 L118.4 49.4 L121.5 50.1 L124.5 50.8 L127.6 51.5 L130.7 52.1 L133.7 52.7 L136.8 53.3 L139.9 53.8 L142.9 54.3 L146.0 54.8 L149.1 55.2 L152.1 55.5 L155.2 55.9 L158.3 56.2 L161.3 56.5 L164.4 56.7 L167.5 56.9 L170.5 57.1 L173.6 57.2 L176.7 57.4 L179.7 57.5 L182.8 57.6 L185.9 57.7 L188.9 57.7 L192.0 57.8" class="pf-curve" fill="none"/><line x1="8" y1="58" x2="192" y2="58" class="pf-axis"/><line x1="50" y1="55" x2="50" y2="61" class="pf-axis"/><text x="50" y="70" class="pf-tick">0</text></svg>
+<div class="pf-sub">tiny mean, huge variance</div>
+</div>
+<div class="pf-arrow"><span>variance reduction</span><svg viewBox="0 0 72 14" aria-hidden="true"><line x1="2" y1="7" x2="66" y2="7"/><path d="M60 2 L68 7 L60 12" fill="none"/></svg></div>
+<div class="pf-card">
+<div class="pf-title">3 of 24 succeed</div>
+<div class="pf-dots"><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot s"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot s"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot s"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span><span class="pf-dot"></span></div>
+<svg viewBox="0 0 200 72" aria-hidden="true"><line x1="76" y1="58" x2="76" y2="8" class="pf-mean"/><path d="M8.0 58.0 L8.0 58.0 L11.1 58.0 L14.1 58.0 L17.2 58.0 L20.3 58.0 L23.3 58.0 L26.4 58.0 L29.5 58.0 L32.5 58.0 L35.6 57.9 L38.7 57.8 L41.7 57.6 L44.8 57.1 L47.9 56.2 L50.9 54.4 L54.0 51.5 L57.1 47.1 L60.1 41.0 L63.2 33.6 L66.3 25.5 L69.3 18.1 L72.4 12.5 L75.5 10.1 L78.5 11.3 L81.6 15.8 L84.7 22.8 L87.7 30.8 L90.8 38.6 L93.9 45.2 L96.9 50.2 L100.0 53.6 L103.1 55.7 L106.1 56.9 L109.2 57.5 L112.3 57.8 L115.3 57.9 L118.4 58.0 L121.5 58.0 L124.5 58.0 L127.6 58.0 L130.7 58.0 L133.7 58.0 L136.8 58.0 L139.9 58.0 L142.9 58.0 L146.0 58.0 L149.1 58.0 L152.1 58.0 L155.2 58.0 L158.3 58.0 L161.3 58.0 L164.4 58.0 L167.5 58.0 L170.5 58.0 L173.6 58.0 L176.7 58.0 L179.7 58.0 L182.8 58.0 L185.9 58.0 L188.9 58.0 L192.0 58.0 L192.0 58.0 Z" class="pf-fill"/><path d="M8.0 58.0 L11.1 58.0 L14.1 58.0 L17.2 58.0 L20.3 58.0 L23.3 58.0 L26.4 58.0 L29.5 58.0 L32.5 58.0 L35.6 57.9 L38.7 57.8 L41.7 57.6 L44.8 57.1 L47.9 56.2 L50.9 54.4 L54.0 51.5 L57.1 47.1 L60.1 41.0 L63.2 33.6 L66.3 25.5 L69.3 18.1 L72.4 12.5 L75.5 10.1 L78.5 11.3 L81.6 15.8 L84.7 22.8 L87.7 30.8 L90.8 38.6 L93.9 45.2 L96.9 50.2 L100.0 53.6 L103.1 55.7 L106.1 56.9 L109.2 57.5 L112.3 57.8 L115.3 57.9 L118.4 58.0 L121.5 58.0 L124.5 58.0 L127.6 58.0 L130.7 58.0 L133.7 58.0 L136.8 58.0 L139.9 58.0 L142.9 58.0 L146.0 58.0 L149.1 58.0 L152.1 58.0 L155.2 58.0 L158.3 58.0 L161.3 58.0 L164.4 58.0 L167.5 58.0 L170.5 58.0 L173.6 58.0 L176.7 58.0 L179.7 58.0 L182.8 58.0 L185.9 58.0 L188.9 58.0 L192.0 58.0" class="pf-curve" fill="none"/><line x1="8" y1="58" x2="192" y2="58" class="pf-axis"/><line x1="50" y1="55" x2="50" y2="61" class="pf-axis"/><text x="50" y="70" class="pf-tick">0</text></svg>
+<div class="pf-sub">same mean, <span class="pf-hi">less variance</span></div>
 </div>
 </figure>
 
-Apparently the problem is too difficult for the model. Three answers recall the same formula, which is right for a cube of side 3 but not 5, and the fourth miscounts. Since all attempts fail, the prompt contributes nothing to the batch gradient.
+Notice that a group with all successes or all failures contributes **zero** variance, not infinite variance: it is silent rather than noisy. A group with one success has a real signal, but everything it says about what a right answer looks like comes from that single answer, so the variance is huge. This is another way to see why signal seeking and variance reduction are two _separate_ algorithmic considerations. The first moves a prompt from the left box to the middle one; the second moves it from the middle box to the right one.
 
-Most work on adaptive sampling so far is about prompts like this one, and its simplest form is now standard at scale. DAPO oversamples prompts, drops every group whose answers all agree, and keeps sampling until the batch is full of prompts with signal ([Yu et al., 2025](#ref-yu2025)). ScaleRL keeps this zero-variance filter in a recipe it scales to a single 100,000-GPU-hour run, and also stops revisiting prompts the model already passes at least 90% of the time ([Khatri et al., 2025](#ref-khatri2025)); Olmo 3 refills its batches the same way, which it calls active sampling ([Team Olmo, 2025](#ref-olmo2025)). Filtering pays for rollouts and then throws them away, so later work tries to spend them better: skip the prompts that are likely to come back all right or all wrong ([Zheng et al., 2025](#ref-zheng2025)), or move rollouts toward hard prompts, either under an explicit budget ([Li et al., 2025](#ref-li2025)) or by sampling a hard prompt until it is solved ([Noukhovitch et al., 2026](#ref-noukhovitch2026)). And when the model essentially never succeeds, more samples won't help; the remedy is to make the problem easier, for example by revealing part of a reference solution ([Qu et al., 2026](#ref-qu2026)).
+We find that this perspective provides a nice dichotomy of the past literature.
+
+**From 0 to 1: signal seeking.** When every rollout of a prompt fails, every advantage is zero and the prompt contributes nothing to the batch gradient. Most work on adaptive sampling so far is about prompts like this, and its simplest form is now standard at scale. DAPO oversamples prompts, drops every group whose answers all agree, and keeps sampling until the batch is full of prompts with signal ([Yu et al., 2025](#ref-yu2025)). ScaleRL keeps this zero-variance filter in a recipe it scales to a single 100,000-GPU-hour run, and also stops revisiting prompts the model already passes at least 90% of the time ([Khatri et al., 2025](#ref-khatri2025)); Olmo 3 refills its batches the same way, which it calls active sampling ([Team Olmo, 2025](#ref-olmo2025)). Filtering pays for rollouts and then throws them away, so later work tries to spend them better: skip the prompts that are likely to come back all right or all wrong ([Zheng et al., 2025](#ref-zheng2025)), or move rollouts toward hard prompts, either under an explicit budget ([Li et al., 2025](#ref-li2025)) or by sampling a hard prompt until it is solved ([Noukhovitch et al., 2026](#ref-noukhovitch2026)). And when the model essentially never succeeds, more samples won't help; the remedy is to make the problem easier, for example by revealing part of a reference solution ([Qu et al., 2026](#ref-qu2026)).
 
 We think much of signal seeking is better handled one level up, by designing environments and curricula that keep the model near the edge of what it can solve. How to find that edge automatically is a topic for another post.
 
-### 1.2 From $$1$$ success to More: Variance Reduction {#sharpen}
-
-Now take a prompt the model sometimes gets right. The same checkpoint answers another competition problem four times, and one answer is correct:
-
-<figure class="trace-fig">
-<div class="trace-card">
-  <div class="trace-prompt"><span class="lbl"><span>Prompt</span><span class="key">Correct answer: 9</span></span>How many ways are there to arrange the letters A, A, A, H, H in a row so that the sequence HA appears at least once?</div>
-  <div class="trace bad"><span class="n">1</span><span class="excerpt">… 10. HHAAA → no HA … Arrangements with “HA”: 2, 3, 4, 5, 6, 8, 9 → that's 7 arrangements.</span><span class="ans">7 <span class="mark">✗</span><span class="tok">620 tokens</span></span></div>
-  <div class="trace bad"><span class="n">2</span><span class="excerpt">… So the arrangements without “HA” are: 1. AAAHH 10. HHAAA … 10 − 2 = 8</span><span class="ans">8 <span class="mark">✗</span><span class="tok">824 tokens</span></span></div>
-  <div class="trace ok"><span class="n">3</span><span class="excerpt">… 10. HHAAA → contains HA (positions 2-3) … Only arrangement 1 (AAAHH) does not contain “HA” … 10 − 1 = 9</span><span class="ans">9 <span class="mark">✓</span><span class="tok">772 tokens</span></span></div>
-  <div class="trace bad"><span class="n">4</span><span class="excerpt">… the number of ways to place 2 H's into these 3 gaps is (3 choose 2) = 3 … 10 − 3 = 7</span><span class="ans">7 <span class="mark">✗</span><span class="tok">701 tokens</span></span></div>
-</div>
-</figure>
-
-All four answers count the same 10 arrangements and part ways only when they look for the ones without HA: the third notices that HHAAA contains HA, and the others miss it. So this prompt has a real learning signal. The group mean is 1/4, so the update pushes the correct answer up and the three wrong ones down, and on average that moves the model toward answers like the third.
-
-It is also very noisy. Each answer is hundreds of tokens long, and every token adds its own random contribution to the gradient. Most of those tokens, restating the problem or counting the 10 arrangements, have nothing to do with why the third answer is right, and with a single success the update cannot tell the decisive step from the incidental ones. More successes and failures average these accidents away. But every extra rollout costs inference compute, and every one we train on costs training compute. Variance reduction asks how many more to buy, and for which prompts. That is the question our algorithm answers.
+**From 1 to more: variance reduction.** Once a prompt has at least one success and one failure, it has a real learning signal: the update pushes the correct answers up and the wrong ones down. It is also very noisy. Each answer is thousands of tokens long, and every token adds its own random contribution to the gradient. Most of those tokens have nothing to do with why a correct answer is right, and with a single success the update cannot tell the decisive step from the incidental ones. More successes and failures average these accidents away. But every extra rollout costs inference compute, and every one we train on costs training compute. Variance reduction asks how many more to buy, for which prompts, and which ones to train on. That is the question we answer.
 
 Prior work has asked this question too. GVM-RAFT made the case for allocating samples unevenly across prompts to minimize gradient variance under a sampling budget ([Yao et al., 2025](#ref-yao2025)). Reinforce-Ada trains on balanced groups of successes and failures under a log-shaped objective ([Xiong et al., 2025](#ref-xiong2025)). PODS generates many rollouts but trains only on a high-variance subset, because the update phase has costs of its own ([Xu et al., 2025](#ref-xu2025)). VIP predicts each prompt's success rate with a Gaussian process and solves for the allocation that minimizes total gradient variance under a rollout budget ([Nguyen et al., 2026](#ref-nguyen2026)), and DUET does the same under a budget of generated tokens ([Hu et al., 2026](#ref-hu2026)).
 
-These allocation rules budget rollouts or generated tokens. We also charge for training on the responses we keep, and we buy *pairs*, the unit a balanced update actually uses.
+These allocation rules budget rollouts or generated tokens. We also charge for training on the answers we keep, and we choose which ones to keep.
 
-### 1.3 The problem we solved {#problem}
+**The problem we solved.** For this project, we focused on the second question, namely **variance reduction** when a non-zero mean gradient is guaranteed. As we will explain in detail later, at the start of each batch, our algorithm samples $$8$$ rollouts for every prompt (the "probe"). If a prompt scores either $$0/8$$ or $$8/8$$, we give it up for this batch and spend the rest of the compute on the other prompts. For each prompt that remains, we decide how many more rollouts $$n_i$$ to sample, and how many successes $$S_i$$ and failures $$F_i$$ to train on. This way, adaptive sampling becomes exactly a stochastic programming problem.
 
-For this project, we focused on the second question, namely the **variance reduction** when non-zero mean gradient is guranteed. As we will explain in great details later, at the start of each batch, our algorithm will sample $$8$$ rollouts for every prompt (the "probe" period). If any of the prompts score either $$0/8$$ or $$8/8$$, we give them up in this batch and only allocate the rest of compute for the other prompts. This way, the adaptive sampling becomes exactly the stochastic programming problem we now explain.
+Schematically,
 
-Take a batch of prompts that have passed the probe with a mixed result. Prompt $$i$$ has $$s_i$$ correct answers out of 8 (so $$1\le s_i\le 7$$), success rate $$p_i$$, and mean rollout length $$T_i$$, counting the prompt.
+<div class="problem schematic" markdown="1">
+**Problem (adaptive sampling under an expected compute budget).**
 
-- **What we train on.** Like Seq-Balance, we train on balanced success–failure pairs. We use all pairs that can be formed from the probe and follow-up responses. The weights in §2.2 give the update $$\hat g_i$$ the same mean $$\nabla F(p_i)$$ for every realized pair count. We use the log odds of success (§2.1).
-- **What it costs.** We count compute in units of one forward token's FLOPs. Generating a rollout costs $$T_i$$. We price a forward–backward pass at twice the sampling cost per token, so training on a pair, two sequences, costs $$4T_i$$.
+$$
+\begin{aligned}
+\{n_i,S_i,F_i\}={}&\arg\min\ \operatorname{Var}(\text{batch gradient})\\
+&\text{s.t.}\ \mathbb E\big[\text{inference tokens} + 2 \times \text{training tokens}\big]\le C
+\end{aligned}
+$$
+
+</div>
+
+Inference tokens depend on $$n_i$$, and training tokens on $$S_i$$ and $$F_i$$. The extra rollouts come out at random, so the plan has to say in advance how many of each outcome to keep for every way they can come out, and we count tokens in expectation. Section 2 makes this precise and solves it exactly.
+
+## 2. Compute-optimal adaptive sampling {#method}
+
+Everything rests on one identity. For a prompt with success rate $$p$$, let $$\mu_+$$ and $$\mu_-$$ be the mean score $$\nabla\log\pi_\theta(y)$$ of a successful and of a failed answer. The score identity gives $$\mu_+=\nabla p/p$$, and since the score has mean zero, $$\mu_-=-\nabla p/(1-p)$$. So
+
+$$
+\nabla p=p(1-p)\,\big(\mu_+-\mu_-\big).
+$$
+
+The accuracy gradient is a weight times the difference between two class means. We estimate the two means from the successes and failures we train on. The weight we fix before the step, from the prompt's history:
+
+$$
+w_i=\frac{u_i(1-u_i)}{1-u_i^8-(1-u_i)^8},
+$$
+
+where $$u_i$$ is the prompt's success rate estimated from its past visits. The numerator is the $$p(1-p)$$ of the identity, with the history estimate in place of the unknown $$p$$. The denominator is the chance that an eight-rollout probe is mixed. A probe that comes back all right or all wrong ends the visit, and dividing by this chance lets the visits that get through stand in for those that don't. The weight is 0.252 at $$u=0.5$$, 0.19 at $$u=0.2$$ and 0.14 at $$u=0.05$$, and never leaves $$[1/8,\,0.252]$$: once a prompt gets past its probe, it counts about the same whatever its difficulty.
+
+Sampling more and choosing what to keep then only decide how precisely we estimate the two means.
+
+### 2.1 The problem {#problem}
 
 <div class="problem" markdown="1">
-**Problem (rollout allocation under an expected compute budget).**
+**Problem 1 (compute-optimal adaptive sampling).** Each prompt $$i$$ in the batch has, fixed before the step, a weight $$w_i$$ (above), a forecast success rate $$\hat p_i$$, a prompt length $$P_i$$, and mean answer lengths $$T_{i,+}$$ and $$T_{i,-}$$ for successes and failures. Its eight-rollout probe had $$s_i$$ successes, with $$1\le s_i\le7$$. Choose
 
-Suppose a batch of $$B$$ prompts with success rates $$\{p_i\}$$ and expected length $$\{T_i\}$$ where $$i$$ runs from $$1$$ to $$B$$. They already have $$\{s_i\}$$ successful rollouts, and it is guaranteed that $$1\leq s_i \leq 7$$ due to the probe period.
+- a number of follow-up rollouts $$n_i\in\{0,4,8,12,16,24\}$$, and
+- for every possible number $$x$$ of successful follow-ups, how many successes $$S_i(x)\in[1,\,s_i+x]$$ and failures $$F_i(x)\in[1,\,8-s_i+n_i-x]$$ to keep,
 
-If we generate $$n_i$$ independent follow-up rollouts, then $$X_i\sim\operatorname{Binomial}(n_i,p_i)$$ of them succeed. The pooled responses give $$K_i(n_i)=\min(s_i+X_i,\,8-s_i+n_i-X_i)$$ pairs. Let $$C$$ be the batch's expected compute budget and $$C_{\mathrm{probe}}$$ the compute spent generating the probes. The remaining budget $$C_{\mathrm{rem}}=C-C_{\mathrm{probe}}$$ covers follow-up generation and training on the pooled pairs. Conditional on the probe grades, we solve
+to
 
 $$
 \begin{aligned}
-\min_{n_1,\ldots,n_B\in\mathbb Z_{\ge 0}}\quad
-  & \operatorname{tr}\operatorname{Cov}\Big(\sum_{i=1}^{B}\hat g_i(n_i)\Big) \\
-\text{subject to}\quad
-  & \mathbb E\Big[\sum_{i=1}^{B}T_i\big(n_i+4K_i(n_i)\big)\Big]\le C_{\mathrm{rem}} .
+\min\ & \sum_i \mathbb E\left[w_i^2\left(\frac{T_{i,+}}{S_i(X_i)}+\frac{T_{i,-}}{F_i(X_i)}\right)\right]\\
+\text{s.t.}\ & \sum_i \mathbb E\big[n_iG_i+2(P_i+T_{i,+})\,S_i(X_i)\\
+&\qquad\ +2(P_i+T_{i,-})\,F_i(X_i)\big]\le C,
+\end{aligned}
+$$
+
+where $$X_i\sim\operatorname{Binomial}(n_i,\hat p_i)$$ and $$G_i=P_i+\hat p_iT_{i,+}+(1-\hat p_i)T_{i,-}$$.
+
+</div>
+
+Each piece has a plain meaning.
+
+- **The update.** The kept answers form $$g=\sum_iw_i(\bar S_{i,+}-\bar S_{i,-})$$, where $$\bar S_{i,\pm}$$ are the average scores of the kept successes and failures. Per answer, a kept success gets advantage $$+w_i/S_i$$ and a kept failure $$-w_i/F_i$$, on every token.
+- **The objective** is the expected variance of $$g$$, up to a constant, under three assumptions that Section 3 checks. **A1:** an answer's score energy grows linearly with its length, $$\mathbb E\lVert\nabla\log\pi_\theta(y)\rVert^2\approx vT$$ for $$T$$ tokens. **A2:** successes and failures have the same energy per token $$v$$. **A3:** rollouts are independent, and noise dominates signal.
+- **The constraint** is the expected compute left after the probes. Generating a rollout costs its tokens, $$P_i$$ plus its length, and training on one costs twice that. Probes are already paid for, but training on them is not.
+
+### 2.2 The solution {#solution}
+
+**A plan is a table.** Follow-ups come out at random, so the plan has to say in advance what to keep for every possible outcome. For prompt $$i$$ it is a follow-up count $$n_i$$ and a table with one row per possible $$x$$, giving $$S_i(x)$$ and $$F_i(x)$$. The table is fixed before any follow-up is sampled; afterwards we only read the row of the outcome that happened.
+
+**One integer program finds it exactly.** Each expectation in Problem 1 is a finite sum over the outcomes $$x$$, and both the objective and the compute are linear in which $$n$$ and which counts are chosen. So Problem 1 is a mixed-integer linear program, with one binary variable for each candidate $$n$$ and for each candidate count in each row. We solve it to proven optimality (Theorem 2) with HiGHS once per step, which takes a few seconds for 30 prompts.
+
+**What the optimal table looks like.** Put a price $$\lambda$$ on compute. The success part of a row, $$w_i^2T_{i,+}/S+2\lambda(P_i+T_{i,+})S$$, is smallest at
+
+$$
+S_i^\circ=w_i\sqrt{\frac{T_{i,+}}{2\lambda\,(P_i+T_{i,+})}}\;\approx\;\frac{w_i}{\sqrt{2\lambda}},
+$$
+
+and failures work the same way. Two rules follow.
+
+- **Length cancels.** A longer answer is noisier, but it also costs more to train on, in the same proportion. So a prompt aims for the same number of successes and failures whatever their lengths, and prompts with larger weights aim for more of both.
+- **Follow-ups buy the outcome that runs short.** A rollout is a lottery ticket: it lands in an outcome at random. When an outcome is below its target, the plan buys tickets while the expected gain pays for them, then keeps each outcome up to its target.
+
+This is Neyman allocation from stratified sampling ([Neyman, 1934](#ref-neyman1934)), with (prompt, outcome) pairs as the strata, except that a stratum can only be reached by lottery. GVM-RAFT, VIP and DUET derive square-root rules of the same kind across prompts; here the strata also split each prompt by outcome, and the price includes training. The exact solution follows these targets up to rounding, nudging a few counts so that it uses the whole budget.
+
+### 2.3 Two prompts, step by step {#example}
+
+Take two prompts of 200 tokens each and a budget of 140,000 tokens after the probes.
+
+| | Hard prompt | Even prompt |
+|---|---|---|
+| History before this visit | 2 successes, 10 failures | 6 successes, 6 failures |
+| Mean answer length | successes 3,000, failures 6,000 | 3,000 for both |
+
+**1. Freeze the weights.** The history gives $$u=3/14\approx0.21$$ and $$u=0.5$$, so $$w=0.197$$ and $$w=0.252$$. They stay fixed whatever happens in this step.
+
+**2. Probe.** Sample eight rollouts of each prompt and grade them. The hard prompt gets 1 success and the even prompt 4. Both probes are mixed, so both prompts continue.
+
+**3. Forecast.** Folding the probe into the decayed history gives $$\hat p=0.18$$ and $$\hat p=0.50$$. The forecast only predicts the follow-ups; it never enters the update.
+
+**4. Plan, once.** The solver returns the whole plan before anything else is sampled. The even prompt buys no follow-ups and will keep its 4 + 4 probes. The hard prompt buys 4 follow-ups, with this table:
+
+| Successful follow-ups $$x$$ | Chance | Available | Keep |
+|---|---|---|---|
+| 0 | 44% | 1 + 11 | 1 + 5 |
+| 1 | 40% | 2 + 10 | 2 + 4 |
+| 2 | 14% | 3 + 9 | 3 + 4 |
+| 3 | 2% | 4 + 8 | 4 + 4 |
+| 4 | 0.1% | 5 + 7 | 5 + 4 |
+
+Counts are successes + failures. At this budget the price sets the hard prompt's targets at 4.4 successes and 4.5 failures, nearly equal although its failures are twice as long. With 1 success against a target of 4.4, the hard prompt buys tickets, keeps every success it gets, and keeps about four failures. The even prompt's targets are 5.6, but its probes already give 4 + 4, and four more rollouts would not pay for themselves. The table matches the targets except for one extra failure in row 0 and one extra success in row 4, which spend budget the rounding left over.
+
+**5. Sample.** Draw the hard prompt's 4 follow-ups and grade them. Say one succeeds, so $$x=1$$.
+
+**6. Keep.** Row 1 says 2 + 4: keep both successes and 4 of the 10 failures, chosen at random. The even prompt keeps its 4 + 4.
+
+**7. Update.** The hard prompt's two successes get advantage $$+0.197/2=+0.098$$ and its four failures $$-0.197/4=-0.049$$. The even prompt's answers get $$\pm0.252/4=\pm0.063$$. Each prompt's advantages sum to $$+w$$ over its successes and $$-w$$ over its failures.
+
+**8. Record.** Add all twelve rollouts of the hard prompt and all eight of the even prompt to their histories, for the next visit.
+
+### 2.4 Why it is correct {#correctness}
+
+Write $$w(u)=u(1-u)/(1-u^8-(1-u)^8)$$, so that $$w_i=w(u_i)$$, and $$p_i$$ for prompt $$i$$'s true success rate under the current model, and $$g_i=w_i(\bar S_{i,+}-\bar S_{i,-})$$ for its part of the update, with $$g_i=0$$ when its probe is not mixed.
+
+<div class="theorem" markdown="1">
+**Theorem 1 (the update follows the accuracy gradient).** Suppose $$n_i$$, the table, and the choice of which answers to keep depend only on grades and on quantities fixed before the step. Then
+
+1. given the grades, a prompt with a mixed probe has
+
+   $$
+   \mathbb E[g_i\mid\text{grades}]=\frac{w_i\,\nabla p_i}{p_i(1-p_i)},
+   $$
+
+   and under A1–A3 the trace of its covariance is $$v\,w_i^2\,(T_{i,+}/S_i+T_{i,-}/F_i)$$;
+2. averaged over the probe as well,
+
+   $$
+   \mathbb E[g_i]=\frac{w(u_i)}{w(p_i)}\,\nabla p_i .
+   $$
+
+</div>
+
+<div class="proof" markdown="1">
+*Proof.* Fix a prompt and condition on all the grades. Rollouts are independent, so given its grade each answer is a draw from the model's answers with that grade, independent of the others, and keeping a random subset within each grade preserves this. So the kept averages have means $$\mu_+$$ and $$\mu_-$$, and
+
+$$
+\mathbb E[g_i\mid\text{grades}]=w_i(\mu_+-\mu_-)=\frac{w_i\,\nabla p_i}{p_i(1-p_i)}.
+$$
+
+By A1–A3 the two averages are independent, with covariance traces $$vT_{i,+}/S_i$$ and $$vT_{i,-}/F_i$$, which gives the variance. For the second claim, the probe is mixed with probability $$m(p_i)=1-p_i^8-(1-p_i)^8$$, and $$w_i=w(u_i)$$ is fixed before the step, so
+
+$$
+\mathbb E[g_i]=m(p_i)\,\frac{w(u_i)\,\nabla p_i}{p_i(1-p_i)}=\frac{w(u_i)}{w(p_i)}\,\nabla p_i ,
+$$
+
+because $$w(p)=p(1-p)/m(p)$$. <span class="qed">∎</span>
+
+</div>
+
+Three consequences. Each prompt's update points exactly along its accuracy gradient. Its size is exact when the history estimate is right, $$u_i=p_i$$, and since $$w$$ only ranges between $$1/8$$ and $$0.252$$, it is never off by more than a factor of about 2. And because $$\mathbb E[g\mid\text{grades}]$$ depends only on the probes, it is the same for every plan, so minimizing the expected variance given the grades, the objective of Problem 1, minimizes the variance of $$g$$.
+
+The condition of Theorem 1 rules out keeping answers by their content or length (for example, the first to finish), planning on the probes' realized lengths, and weights that look at this visit's follow-ups. The forecast $$\hat p_i$$ only shapes the plan, so a wrong forecast makes the plan less efficient but never moves the mean of the update.
+
+<div class="theorem" markdown="1">
+**Theorem 2 (the solver is exact).** Problem 1 is equivalent to the following mixed-integer linear program, and an optimal solution of either is an optimal solution of the other. For every prompt $$i$$, candidate $$n$$, outcome $$x\le n$$ and count $$k$$, let $$z_{i,n}\in\{0,1\}$$ mean "buy $$n$$ follow-ups", and let $$y^{+}_{i,n,x,k},\,y^{-}_{i,n,x,k}\in\{0,1\}$$ mean "keep $$k$$ successes (failures) in row $$x$$". Write $$\pi_{n}(x)$$ for the Binomial$$(n,\hat p_i)$$ probability of $$x$$, $$a^\pm_{i,k}=w_i^2T_{i,\pm}/k$$ for the variance of keeping $$k$$ answers of an outcome, and $$c^\pm_i=2(P_i+T_{i,\pm})$$ for the cost of training on one. Sums over $$k$$ run over the counts available in row $$x$$, and sums over $$\pm$$ over the two outcomes. Then
+
+$$
+\begin{aligned}
+\min\ &\sum_{i,n,x}\pi_n(x)\sum_{k,\pm}a^\pm_{i,k}\,y^\pm_{i,n,x,k}\\
+\text{s.t.}\ &\sum_n z_{i,n}=1,\quad \sum_k y^\pm_{i,n,x,k}=z_{i,n},\\
+&\sum_{i,n}nG_i\,z_{i,n}\\
+&\ +\sum_{i,n,x}\pi_n(x)\sum_{k,\pm}k\,c^\pm_i\,y^\pm_{i,n,x,k}\le C .
 \end{aligned}
 $$
 
 </div>
 
-For a fixed, nonzero target $$\sum_i\nabla F(p_i)$$, minimizing the variance also minimizes the simple critical batch size $$B_{\text{simple}}=\operatorname{tr}\operatorname{Cov}(\hat g)/\lVert\mathbb E\,\hat g\rVert^2$$ of [McCandlish et al. (2018)](#ref-mccandlish2018), the batch size beyond which larger batches stop paying for themselves.
-
-## 2. The solution: Neyman allocation for pairs {#algorithm}
-
-We first derive the variance of a balanced update at a given pair count, then use it to allocate compute. Section 3 checks A1–A3 against data. Let $$S=\nabla_\theta\log\pi_\theta(y\mid x)$$ be the **score** of a sampled response, a sum of one gradient per token.
-
-- **A1. Score energy grows linearly with length:** $$\mathbb E\lVert S\rVert^2\approx vT$$ for a rollout of length $$T$$. Strictly, only the response carries score, but prompts are short next to responses (about 5% of the tokens in our replay), so we let $$T$$ include the prompt.
-- **A2. Successes and failures have the same size:** at matched length, correct and incorrect responses have the same per-token score energy $$v$$. Their *mean* scores differ, and that difference is the signal.
-- **A3. Noise dominates, and rollouts are independent:** rollouts are i.i.d. given the prompt, prompts are independent, and a response's mean score is small next to its spread, so second moments stand in for covariances.
-- **A4. Planning with expected pair counts.** We treat $$p_i$$ and $$T_i$$ as known and use the expected pair count in the planner. In practice we estimate the rates and lengths from the prompt's history.
-
-### 2.1 The objective: log odds, to run the last mile {#objective}
-
-Plain policy gradient climbs the average success rate. More generally, we can pick an increasing objective $$F(p)$$ and weight the policy gradient by $$F'(p)$$. An appealing choice is $$\log p$$, as in the large-compute limit of MaxRL ([Tajwar et al., 2026](#ref-tajwar2026)): sample until an answer succeeds, and the accepted answer has expected score $$\nabla\log p$$. This puts extra weight on hard prompts.
-
-Once both outcomes are available, though, it's hard to argue that moving from **1% to 2%** should matter more than moving from **98% to 99%**. The first makes success twice as common; the second makes failure half as common. Log odds values the two changes equally:
-
-$$
-F(p)=\log\frac{p}{1-p}.
-$$
-
-In practice we smooth it as $$F_\lambda(p)=\log[(p+\lambda)/(1-p+\lambda)]$$ with $$\lambda=0.02$$, which keeps the derivative finite at the endpoints, and write $$w_\lambda(p)=p(1-p)\,F_\lambda'(p)$$ for the resulting weight. It is close to 1 except near 0% or 100% success.
-
-### 2.2 The best update for one prompt {#estimator}
-
-Write $$D(p)=p^2+(1-p)^2$$, which lies between $$\tfrac12$$ and $$1$$, and let $$\bar S_+$$ and $$\bar S_-$$ be the average scores of the $$K$$ successes and the $$K$$ failures.
-
-<div class="theorem" markdown="1">
-**Proposition 1 (best pair weights).** Under A1–A3, among updates $$a_+\bar S_+-a_-\bar S_-$$ that are unbiased for $$\nabla F_\lambda(p)$$, the variance is smallest for
-
-$$
-a_+=\frac{w_\lambda(p)\,(1-p)}{D(p)},\qquad a_-=\frac{w_\lambda(p)\,p}{D(p)},
-$$
-
-where it equals
-
-$$
-\frac{a}{K},\qquad a:=\frac{vT\,w_\lambda(p)^2}{D(p)} .
-$$
+<div class="proof" markdown="1">
+*Proof.* A plan sets $$z_{i,n_i}=1$$, $$y^+_{i,n_i,x,S_i(x)}=y^-_{i,n_i,x,F_i(x)}=1$$ for every $$x$$, and every other variable to 0; this satisfies the constraints. Conversely, the constraints force a feasible point to pick exactly one $$n$$ per prompt and exactly one count of each outcome in every row of that $$n$$, which is a plan. Under this correspondence the program's objective and compute are the expectations in Problem 1 written as sums over $$x$$, so the two problems have the same feasible plans with the same values. HiGHS returns a solution with a certified zero optimality gap. <span class="qed">∎</span>
 
 </div>
-
-<p class="proof" markdown="1">*Proof.* The score identity gives $$\mathbb E[S_+]=\nabla p/p$$, and since the unconditional score has mean zero, $$\mathbb E[S_-]=-\nabla p/(1-p)$$. The target is $$\nabla F_\lambda=F'_\lambda\nabla p=\tfrac{w_\lambda}{p(1-p)}\nabla p$$, so unbiasedness means $$(1-p)a_++p\,a_-=w_\lambda$$. By A1–A3 each class average has covariance trace $$vT/K$$ and the two are independent, so the variance is $$vT(a_+^2+a_-^2)/K$$. Minimizing $$a_+^2+a_-^2$$ on the line $$(1-p)a_++p\,a_-=w_\lambda$$ picks the point closest to the origin, $$(a_+,a_-)\propto(1-p,\,p)$$, which gives the weights above and $$a_+^2+a_-^2=w_\lambda^2/D$$. <span class="qed">∎</span></p>
-
-Notice what dropped out. **Measured per pair, the success rate barely matters**: a pair from a 10% prompt is worth about as much as a pair from a 50% prompt (up to $$D\in[\tfrac12,1]$$). The success rate still matters, but through *how fast new pairs arrive*: each new pair needs one more of the rarer outcome, which shows up about once every ten rollouts at 10% success and once every two at 50%.
-
-Seq-Balance is already close to this update. For one success and one failure, its mean-centered sum has expectation $$\mathbb E[(1-p)S_+-pS_-]=D(p)\,\nabla\log\tfrac{p}{1-p}$$, so it estimates the log-odds gradient up to a factor $$1/D(p)$$ between 1 and 2. (A [later revision of Reinforce-Ada](#ref-xiong2025) adds an importance weight; we compare against the original estimator.)
-
-### 2.3 Splitting the budget {#allocation}
-
-By Proposition 1 and independence across prompts, the covariance trace conditional on the pair counts is $$\sum_i a_i/K_i(n_i)$$. The conditional mean is constant, so the objective in §1.3 is the expectation of this sum. Write $$\bar K_i(n_i)=\mathbb E[K_i(n_i)]$$. The planner uses $$\bar K_i(n_i)$$ for the expected training cost and approximates $$\mathbb E[1/K_i(n_i)]$$ by $$1/\bar K_i(n_i)$$ in the variance objective.
-
-A linear approximation to the expected pair yield gives a closed-form allocation. Prompt $$i$$ starts with $$K_i^0=\min(s_i,\,8-s_i)$$ pairs. Once the rarer outcome limits pair formation, each extra pair takes about $$1/q_i$$ rollouts, where $$q_i=\min(p_i,1-p_i)$$. Approximate the expected yield by $$\bar K_i(n_i)\approx K_i^0+q_i n_i$$. Including training on both responses, the modeled marginal cost of a pair is
-
-$$
-c_i=T_i\Big(\frac{1}{q_i}+4\Big).
-$$
-
-Reserve $$4\sum_i T_i K_i^0$$ to train on the probe pairs. The available budget for additional pairs is $$C_{\mathrm{extra}}=C_{\mathrm{rem}}-4\sum_i T_i K_i^0$$. Keeping all probe pairs requires $$C_{\mathrm{extra}}\ge 0$$.
-
-<div class="theorem" markdown="1">
-**Theorem 1 (Neyman allocation for pairs).** For each prompt, let $$K_i^0>0$$ be the initial pair count and $$c_i>0$$ the cost per additional pair. The modeled variance at target count $$k_i$$ is $$a_i/k_i$$, with $$a_i>0$$. For a budget $$C_{\mathrm{extra}}\ge 0$$, the continuous problem
-
-$$
-\begin{aligned}
-\min_{k_i\ge K_i^0}\quad & \sum_i \frac{a_i}{k_i} \\
-\text{subject to}\quad & \sum_i c_i(k_i-K_i^0)\le C_{\mathrm{extra}}
-\end{aligned}
-$$
-
-has solution
-
-$$
-K_i^\star=\max\!\Big(K_i^0,\ \theta\sqrt{a_i/c_i}\Big)
-$$
-
-where $$\theta$$ is the unique level satisfying $$\sum_i c_i\,(K_i^\star-K_i^0)=C_{\mathrm{extra}}$$ when $$C_{\mathrm{extra}}>0$$. If $$C_{\mathrm{extra}}=0$$, the solution is $$K_i^\star=K_i^0$$ for every prompt.
-
-</div>
-
-<p class="proof" markdown="1">*Proof.* At zero budget, only the initial counts are feasible. At positive budget, the objective is strictly convex and decreasing in each $$k_i$$, so the budget binds. If $$\eta$$ is its multiplier, the KKT conditions give $$a_i/k_i^2=\eta c_i$$ above the floor and $$a_i/(K_i^0)^2\le\eta c_i$$ at the floor. Both cases are captured by $$k_i=\max(K_i^0,\eta^{-1/2}\sqrt{a_i/c_i})$$. Spending is continuous and strictly increasing in $$\theta=\eta^{-1/2}$$ once it is positive, which gives a unique level. <span class="qed">∎</span></p>
-
-The corresponding rollout allocation is $$n_i^\star=(K_i^\star-K_i^0)/q_i$$. Every prompt assigned extra rollouts ends at the same marginal variance reduction per FLOP, $$a_i/(c_i(K_i^\star)^2)=1/\theta^2$$.
-
-In words: **every prompt has a target number of pairs, and compute goes first to the prompts furthest below their targets.** Raising the budget raises every target in proportion. Three consequences:
-
-- **Length cancels.** The noise per pair $$a_i$$ and its price $$c_i$$ are both proportional to $$T_i$$, so the target $$\theta\sqrt{v\,w_\lambda^2/(D\,(1/q+4))}$$ depends only on the success rate. A prompt with long answers gets as many pairs as one with short answers; they just cost more.
-- **Lopsided prompts get lower targets**, because their pairs are expensive, but they also start with fewer pairs. A 1/8 probe has one pair; a 4/8 probe has four.
-- **Pairs in hand matter.** A prompt whose probe already exceeds its target gets nothing more, however cheap its rollouts are.
-
-Theorem 1 is Neyman allocation from stratified sampling ([Neyman, 1934](#ref-neyman1934)): each stratum's sample size grows with its standard deviation and shrinks with the square root of its unit cost. GVM-RAFT, VIP and DUET derive rules of the same square-root form for rollouts. Two things differ here. The unit we buy is a pair, so the probe sets a floor $$K_i^0$$: a prompt is only ever topped up to its target, so the rule is a square root with a floor rather than a pure square root. And the price of a pair includes training on it.
-
-### 2.4 The algorithm in practice {#practice}
-
-1. **Probe.** Every prompt visit starts with eight rollouts. We estimate $$p_i$$ from the probe and the prompt's decayed past reward counts, with Beta(1,1) smoothing, and estimate $$T_i$$ from the same history.
-2. **Gate.** A prompt whose probe is all right or all wrong gets no extra rollouts on this visit; it is a signal-seeking problem. The gate gives up some learning: a prompt with a true 10% success rate still produces eight failures about 43% of the time.
-3. **Allocate.** For each mixed prompt we consider $$n_i\in\{0,8,16,24\}$$ extra rollouts and compute $$\bar K_i(n_i)$$ from the binomial distribution. A small dynamic program minimizes $$\sum_i a_i/\bar K_i(n_i)$$ subject to the expected compute budget on a discretized cost grid. (Our code counts only response tokens in the noise term, which slightly lowers the target of a prompt with a long prompt text.)
-4. **Update.** We keep every balanced pair the pooled answers provide and apply the weights of Proposition 1. For a response with reward $$r$$ in a group with $$k$$ actual pairs, the per-token advantage is
-   $$
-   A(r)=\frac{4}{2k}\,\frac{w_\lambda(p)}{D(p)}\,(r-p),
-   $$
-   where $$4/(2k)$$ gives each prompt the scale of a four-response Seq-Balance group, so extra pairs add samples rather than weight. We center with the ordinary success rate; a length-weighted baseline is optimal in theory but saved less than 1% of the noise in practice ([Appendix C](#app-baseline)).
-
-<details markdown="1">
-<summary>What the planner leaves out</summary>
-
-The follow-up planner conditions on mixed probes. Across all prompt visits, the gate can change the mean and variance of the update by dropping prompts with one-sided probes. Realized lengths and pair counts can also push a batch above or below its expected budget, so we compare methods by cumulative compute, including discarded rollouts.
-
-</details>
-
-<details markdown="1">
-<summary>A two-prompt example with the discrete planner</summary>
-
-Take two prompts. A got 1/8, and its rollouts run about 500 tokens, prompt included; B got 4/8, and its rollouts run about 200 tokens. Their histories put their success rates at 25% and 50%. With 24,000 units left after the probes, the planner gives **16 more rollouts to A and none to B**, while still training on B's four probe pairs. The plan uses about 21,200 units and expects about five pairs from A and four from B; another block of eight for B would go over budget. Spending about the same on 8 rollouts for A and 16 for B leaves 16% more modeled noise. In the language of Theorem 1, B's target is about a third higher than A's ($$\sqrt{a/c}\approx0.55$$ vs $$0.42$$, in units of $$\theta$$), but B starts with four pairs and A with one, so A is much further below its target.
-
-</details>
 
 ## 3. Checking the assumptions {#assumptions}
 
-We test A1 and A2 with frozen-policy diagnostics on **Qwen3-4B** in thinking mode: 40 hard competition-math prompts, 48 rollouts each. For A3 we use the Qwen3-8B checkpoint of §4 and report the upper end of a 95% interval.
+Each assumption does one job in Problem 1. **A1** makes a kept answer add variance in proportion to its length, which is why the objective counts tokens, $$T_{i,+}/S_i$$ and $$T_{i,-}/F_i$$. **A2** makes the energy per token $$v$$ the same for both outcomes, so it factors out and successes and failures are priced on one scale. **A3** lets the variances of the two kept averages add, and lets the plan minimize variance without tracking the mean gradient.
 
-<div class="table-wrap">
-<table class="paper-table wrap">
-<thead>
-<tr><th>Assumption</th><th>What we measured</th><th>Result</th></tr>
-</thead>
-<tbody>
-<tr><td>A1. Energy ∝ length</td><td>fitted exponent of score energy vs. length, layers 18–35</td><td class="hl">0.97 ± 0.03</td></tr>
-<tr><td>A2. Same size for both outcomes</td><td>energy of incorrect / correct answers at matched length</td><td class="hl">1.005 ± 0.007</td></tr>
-<tr><td>A3. Noise dominates</td><td>‖E g‖² / tr Cov(g) per batch, Qwen3-8B replay (§4)</td><td>at most about 0.4%</td></tr>
-</tbody>
-</table>
-</div>
-
-The plot below shows A1 and A2 for layers 18–35 on log–log axes: score energy against rollout length, with each prompt's energy per token divided out and answers averaged in length bins. Correct answers, incorrect answers, and incorrect answers cut off at the length cap all fall on the same slope-one line. Earlier layers have much heavier tails ([Appendix A](#app-energy)).
-
-<figure class="narrow">
-  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/score-energy-main.png' | relative_url }}"><img src="{{ '/assets/images/score-energy-main.png' | relative_url }}" alt="Score energy against rollout length on log-log axes, for layers 18 to 35. Correct answers, incorrect answers, and incorrect answers that hit the length cap all lie on the same slope-one line." loading="lazy"></a>
-</figure>
-
-A1 and A2 hold well in the later layers. Together they also predict that plain policy gradient has per-rollout noise $$\operatorname{tr}\operatorname{Cov}((R-p)S)\approx v\,p(1-p)\,T$$: the $$p(1-p)$$ is the variance of the binary reward, and the $$T$$ comes from summing over the response. [Appendix B](#app-variance) checks the $$p(1-p)$$ dependence across prompts. A3 holds by a wide margin: at the Qwen3-8B checkpoint, a batch's mean gradient is a fraction of a percent of its noise, so this checkpoint sits deep in the noise-dominated regime.
-
-## 4. Results {#results}
-
-### 4.1 At equal compute, our algorithm cuts gradient variance by 39% {#replay}
-
-**Setup.** We froze the step-100 Qwen3-8B checkpoint from our algorithm's training run, eight training prompts, and their success-rate and length estimates. We then sampled 128 independent rollout tapes, in two rounds of 64, plus 8 more for calibrating budgets, and replayed three collection rules on every tape:
-
-- **Seq-Balance**, as in Reinforce-Ada: sample in rounds of eight until there are two successes and two failures, up to 32 rollouts.
-- **Uniform follow-ups**: our probe, gate and pair update, with the extra blocks of rollouts spread evenly at random over the mixed prompts.
-- **Our algorithm**: the same, with the extra blocks chosen by the planner of §2.4.
-
-All three use the same grades, the same smoothed log-odds weights from the frozen success rates, the same realized-pair normalization, and zero KL. Budgets were calibrated on the separate tapes so that mean compute roughly matches. Tinker returned LoRA gradient norms at zero learning rate, from which we estimate the gradient variance. The two rounds cost about $120.
-
-The table gives each rule's compute and gradient variance per batch of eight prompts. The last row multiplies the two and divides by Seq-Balance's value, which compares the rules at equal compute; brackets are 95% intervals from a bootstrap over blocks of tapes.
+We test A1 and A2 on a frozen **Qwen3-4B** in thinking mode, with 40 hard competition-math prompts and 48 rollouts each, and A3 on the Qwen3-8B checkpoint of Section 4. Intervals are 95%.
 
 <div class="table-wrap">
 <table class="paper-table">
 <thead>
-<tr><th>Per batch</th><th>Seq-Balance</th><th>Uniform follow-ups</th><th>Our algorithm</th></tr>
+<tr><th>Assumption</th><th>What we measured</th><th>Result</th></tr>
 </thead>
 <tbody>
-<tr><td>Compute (forward-token units)</td><td>455k</td><td>449k</td><td>444k</td></tr>
-<tr><td>Gradient variance, tr Cov</td><td>2.73M</td><td>1.94M</td><td>1.71M</td></tr>
-<tr class="rule-above"><td>Variance × compute, vs. Seq-Balance</td><td>1</td><td>0.70 <span class="muted">[0.65, 0.75]</span></td><td class="hl">0.61 <span class="muted">[0.58, 0.65]</span></td></tr>
+<tr><td>A1. Energy ∝ length</td><td>fitted exponent of score energy vs. length, layers 18–35</td><td class="hl">0.97 ± 0.06</td></tr>
+<tr><td>A2. Same energy per token for both outcomes</td><td>energy of incorrect / correct answers at matched length</td><td class="hl">1.005 ± 0.013</td></tr>
+<tr><td>A3. Noise dominates</td><td>‖E g‖² / tr Cov(g) per batch, Qwen3-8B replay (§4)</td><td class="hl">at most 0.5%</td></tr>
 </tbody>
 </table>
 </div>
 
-The plot below shows the same comparison: the left panel gives each rule's gradient variance per batch, and the right panel puts the rules on equal compute. Lines are 95% intervals.
+**Reading the first plot.** For each answer we take its score energy $$\lVert\nabla\log\pi_\theta(y)\rVert^2$$ in layers 18–35 and divide it by its prompt's average energy per token. This removes the differences in $$v$$ between prompts and leaves a number measured in tokens. Under A1 that number equals the answer's length, so answers fall on the dashed diagonal; under A2, correct and incorrect answers fall on the same diagonal. Each marker averages the answers in one length bin, with a 95% interval, on log–log axes.
 
-<figure>
-  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/replay-128.png' | relative_url }}"><img src="{{ '/assets/images/replay-128.png' | relative_url }}" alt="Left: gradient variance per batch is 2.73 million for Seq-Balance, 1.94 million for uniform follow-ups and 1.71 million for our algorithm. Right: variance times compute relative to Seq-Balance is 0.70 for uniform follow-ups and 0.61 for our algorithm, both with intervals well below 1." loading="lazy"></a>
+<figure class="narrow">
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/score-energy-vs-length.png' | relative_url }}"><img src="{{ '/assets/images/score-energy-vs-length.png' | relative_url }}" alt="Normalized score energy against answer length on log-log axes, for layers 18 to 35 of Qwen3-4B. Correct and incorrect answers both lie on the diagonal from about 5,000 to 16,000 tokens." loading="lazy"></a>
+  <figcaption>Score energy against length, layers 18–35. Bins are length octiles; answers that hit the length cap are left out.</figcaption>
 </figure>
 
-Two things stand out:
+Both outcomes sit on the diagonal across a threefold range of lengths. Answers cut off at the length cap, all of them incorrect, carry about 4% more energy than the line predicts ($$1.036\pm0.013$$ times). Earlier layers have heavier tails ([Appendix A](#app-energy)). A3 holds by a wide margin: at the Qwen3-8B checkpoint, a batch's mean gradient is at most 0.5% of its noise.
 
-1. **Our algorithm beats Seq-Balance by a wide margin**: 39% lower variance at equal compute, with an interval of 35–42%.
-2. **Both parts of the design pay off.** Probing, gating and keeping every pair already cut variance by 30%, with follow-up rollouts spread uniformly. Neyman allocation of those follow-ups then removes another 13% of the variance that remains (interval 7–18%).
+**A prediction we don't need, tested anyway.** Nothing in Section 2 assumes how a prompt's noise depends on its success rate. A1 and A2 still predict it: for plain policy gradient on one rollout,
+
+$$
+\operatorname{tr}\operatorname{Cov}\big((R-p)\nabla\log\pi_\theta(y)/\sqrt{T}\big)\approx v\,p(1-p),
+$$
+
+the energy per token times the variance of the binary reward. The second plot tests this on the same frozen Qwen3-4B, using LoRA gradients for 10 prompts with success rates from 0.08 to 0.94 and 1,000 to 3,000 rollouts each. Each dot is one prompt, with a 95% interval, and the dashed line is the best fit proportional to $$p(1-p)$$.
+
+<figure class="narrow">
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/variance-vs-pq.png' | relative_url }}"><img src="{{ '/assets/images/variance-vs-pq.png' | relative_url }}" alt="Per-token gradient variance of plain policy gradient against p(1-p) for ten prompts. The points rise roughly in proportion to p(1-p); one prompt near p(1-p)=0.22 lies well above the line." loading="lazy"></a>
+  <figcaption>Per-token gradient variance against <i>p</i>(1&#8202;−&#8202;<i>p</i>), one dot per prompt.</figcaption>
+</figure>
+
+The prediction holds roughly. Most prompts lie within about 15% of the line, and fitting the exponent freely gives $$0.95\pm0.17$$. The spread is wider than the error bars, though, and one prompt at $$p\approx0.68$$ is about 50% noisier than the line: $$v$$ is not quite the same for every prompt, while Problem 1 treats it as one constant.
+
+## 4. Results {#results}
+
+### 4.1 At equal compute, our algorithm cuts gradient variance by 17% {#replay}
+
+**Setup.** We froze a Qwen3-8B checkpoint after 100 steps of RL training, together with eight of its training prompts and their history. We sampled 64 independent rollout tapes, each with 32 rollouts per prompt, and replayed two rules on every tape: **GRPO-8**, which trains on eight rollouts of every prompt, and **our algorithm** (Section 2), with the per-prompt compute budget it was trained with. Both use the loss they were trained with, StableReinforce with KL coefficient 0.01, and our algorithm uses the weight it was trained with, $$u(1-u)$$. Tinker returned unclipped LoRA gradient norms at zero learning rate, from which we estimate the variance of a batch's gradient and the squared norm of its mean (details below). Brackets are 95% bootstrap intervals over eight independent blocks of eight tapes.
+
+<div class="table-wrap">
+<table class="paper-table">
+<thead>
+<tr><th>Per batch of eight prompts</th><th>GRPO-8</th><th>Our algorithm</th></tr>
+</thead>
+<tbody>
+<tr><td>Compute (weighted tokens)</td><td>528k</td><td>516k</td></tr>
+<tr><td>Variance, \(\operatorname{tr}\operatorname{Cov}(g)\), ×10⁵</td><td>11.1 [10.4, 11.9]</td><td>3.1 [2.8, 3.3]</td></tr>
+<tr><td>Squared mean, \(\lVert\mathbb E g\rVert^2\), ×10³</td><td>2.6 [−0.1, 5.3]</td><td>0.3 [−0.4, 1.0]</td></tr>
+</tbody>
+</table>
+</div>
+
+The raw variance is 72% lower, but the two rules estimate the gradient at different scales, so this number alone means little. The mean cannot settle the scale either: both intervals include zero, because a batch's mean gradient is a fraction of a percent of its noise (A3).
+
+The scale follows from the two rules instead. GRPO-8 subtracts the group's mean reward, and that mean includes the answer's own reward: $$r_j-\bar r=\tfrac78\,(r_j-\bar r_{-j})$$, where $$\bar r_{-j}$$ is the mean of the other seven. That leave-one-out mean is independent of answer $$j$$, so each answer contributes $$\tfrac78\nabla p$$ on average, and the eight answers sum to $$7\,\nabla p$$ per prompt. Our algorithm gives the kept successes and failures totals of $$\pm4w$$, so by Theorem 1 it contributes $$4\,\nabla p$$ per prompt when the history is right. Our gradient is therefore $$4/7$$ of GRPO-8's, and multiplying it by $$7/4$$ puts the two on the same scale:
+
+<div class="table-wrap">
+<table class="paper-table">
+<thead>
+<tr><th>Per batch, our algorithm rescaled by 7/4</th><th>GRPO-8</th><th>Our algorithm</th></tr>
+</thead>
+<tbody>
+<tr><td>Variance, ×10⁵</td><td>11.1 [10.4, 11.9]</td><td>9.4 [8.7, 10.2]</td></tr>
+<tr><td>Squared mean, ×10³</td><td>2.6 [−0.1, 5.3]</td><td>1.0 [−1.1, 3.1]</td></tr>
+<tr><td>(Simple) critical batch size</td><td>431 [200, ∞)</td><td>951 [314, ∞)</td></tr>
+</tbody>
+</table>
+</div>
+
+Rescaled, our variance per batch is 0.85 [0.78, 0.93] of GRPO-8's, and our batches cost 2% less compute, so at equal compute our gradient has 17% less variance: 0.83 [0.77, 0.91]. The last row is the simple critical batch size of [McCandlish et al. (2018)](#ref-mccandlish2018), $$\operatorname{tr}\operatorname{Cov}(g)/\lVert\mathbb E g\rVert^2$$, in batches of eight prompts; it does not depend on the scale. We report it for completeness only. Because neither mean is resolved, both intervals are unbounded above, and the point estimates are unstable: pooling all 64 tapes instead of averaging over blocks gives 309 for GRPO-8 and 260 for our algorithm.
+
+Two caveats. The factor $$4/7$$ is exact for the gate-corrected weight of Section 2; this run used $$u(1-u)$$, under which each of these eight prompts gets between 0.54 and 0.99 of its share, less when its probe is often one-sided, so the match is approximate. And the KL term, which is charged on every kept token, is not on this scale.
 
 <details markdown="1">
 <summary>Measuring variance and signal from gradient norms</summary>
 
-For each rule and each round of 64 tapes, Tinker returned the unclipped LoRA gradient norm of every tape, of 32 disjoint pairs of tapes, of disjoint blocks of tapes (8 in the first round, 16 in the second), and of all 64 together, with the optimizer at zero learning rate; we checked that the policy stayed frozen throughout. For $$B$$ independent batch gradients $$g_1,\dots,g_B$$ with mean $$G$$,
+For each rule, Tinker returned the unclipped LoRA gradient norm of every tape, of disjoint pairs and blocks of tapes, and of all tapes together, with the optimizer at zero learning rate; we checked that the policy did not change. For $$B$$ independent batch gradients $$g_b$$ with mean $$G$$,
 
 $$
 \widehat V=\frac{\sum_b\lVert g_b\rVert^2-\lVert\sum_b g_b\rVert^2/B}{B-1},
-\qquad
+$$
+
+$$
 \widehat{\lVert G\rVert^2}=\frac{\lVert\sum_b g_b\rVert^2-\sum_b\lVert g_b\rVert^2}{B(B-1)}
 $$
 
@@ -318,41 +384,46 @@ are unbiased for $$\operatorname{tr}\operatorname{Cov}(g)$$ and $$\lVert G\rVert
 
 </details>
 
-### 4.2 A single-seed training run {#training}
+### 4.2 Training {#training}
 
-**Setup.** We train Qwen3-8B with each of three methods on 300 prompts from the [Reinforce-Ada hard-prompt dataset](#ref-dataset), one seed each, at learning rate $$2\times10^{-5}$$ with the [StableReinforce](#ref-tinker) loss in Tinker. Seq-Balance and our algorithm ran 100 updates. GRPO samples a fixed group of eight answers for each of 30 prompts per batch and centers rewards by the group mean; it ran until it had used as much compute as our algorithm, at 110 updates. Every 25 updates we draw 16 answers to each of 60 held-out prompts and report pass@1 among graded answers (1–3% of answers per checkpoint could not be graded). Compute counts prefill and sampled tokens plus twice the learner tokens.
-
-The plot below follows held-out accuracy against cumulative training compute, with a point every 25 updates.
+**Setup.** We train Qwen3-8B with each method on 300 prompts from the [Reinforce-Ada hard-prompt dataset](#ref-dataset), one seed each, at learning rate $$2\times10^{-5}$$ with the [StableReinforce](#ref-tinker) loss in Tinker and KL coefficient 0.01. Every method draws 30 prompts per update. GRPO-8 samples eight answers to each and centers rewards by the group mean. Our algorithm has an expected budget of 1.96 million weighted tokens per update, probes included, and uses the weight $$u(1-u)$$, as in Section 4.1. Seq-Balance was trained with an earlier version of the grader, which differs on two training prompts. Every 25 updates we draw 16 answers to each of the same 60 held-out prompts for every method, graded the same way, and report accuracy among graded answers. Total compute counts prefill and sampled tokens plus twice the training tokens, and training compute counts only the latter; we convert both to FLOPs at $$2N$$ per token, with $$N=8\times10^9$$.
 
 <figure>
-  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/heldout-three-arms.png' | relative_url }}"><img src="{{ '/assets/images/heldout-three-arms.png' | relative_url }}" alt="Held-out pass@1 against cumulative training compute for one run per method. GRPO ends at 53.2 percent at 196 million units and our algorithm at 52.7 percent at 198 million; Seq-Balance peaks at 49.2 percent at 118 million and ends at 47.4 percent at 166 million." loading="lazy"></a>
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/heldout-accuracy-vs-compute.png' | relative_url }}"><img src="{{ '/assets/images/heldout-accuracy-vs-compute.png' | relative_url }}" alt="Held-out accuracy against total compute and against training compute for Seq-Balance, GRPO-8 and our algorithm. Our algorithm is above GRPO-8 at every checkpoint on both axes; at the end of training the two are level in total compute." loading="lazy"></a>
+  <figcaption>Held-out accuracy against total compute (left) and training compute (right), after 25, 50, 75 and 100 updates (110 for GRPO-8).</figcaption>
 </figure>
-
-The table compares the final checkpoints, with compute in millions of weighted tokens; brackets are 95% paired bootstrap intervals over the 60 held-out prompts.
 
 <div class="table-wrap">
 <table class="paper-table">
 <thead>
-<tr><th></th><th>Seq-Balance</th><th>GRPO</th><th>Our algorithm</th></tr>
+<tr><th>At the end of training</th><th>GRPO-8</th><th>Seq-Balance</th><th>Our algorithm</th></tr>
 </thead>
 <tbody>
-<tr><td>Held-out pass@1, final checkpoint</td><td>47.4% <span class="muted">at 166M</span></td><td>53.2% <span class="muted">at 196M</span></td><td>52.7% <span class="muted">at 198M</span></td></tr>
-<tr><td>Best checkpoint</td><td>49.2% <span class="muted">at 118M</span></td><td>53.2% <span class="muted">at 196M</span></td><td>52.7% <span class="muted">at 198M</span></td></tr>
-<tr><td>Our algorithm minus this method, final checkpoints</td><td>+5.3 pts <span class="muted">[+1.9, +8.8]</span></td><td>−0.5 pts <span class="muted">[−3.9, +3.0]</span></td><td>—</td></tr>
-<tr><td>Pairs kept per million weighted tokens</td><td>29.6</td><td>—</td><td>46.3</td></tr>
+<tr><td>Updates</td><td>110</td><td>100</td><td>100</td></tr>
+<tr><td>Total compute (EFLOPs)</td><td>3.13</td><td>2.66</td><td>3.16</td></tr>
+<tr><td>Training compute (EFLOPs)</td><td>2.08</td><td>0.89</td><td>1.67</td></tr>
+<tr><td>Train accuracy</td><td>56.2%</td><td>52.9%</td><td>58.8%</td></tr>
+<tr class="rule-above"><td>Held-out accuracy</td><td>53.2%</td><td>47.4%</td><td class="hl">53.7%</td></tr>
 </tbody>
 </table>
 </div>
 
-Our algorithm beats Seq-Balance. After the same 100 updates it reaches 52.7% held-out pass@1 against Seq-Balance's 47.4%, a gap of 5.3 points with an interval of +1.9 to +8.8. It also gets more of what its update needs out of each unit of compute, keeping 46.3 success–failure pairs per million weighted tokens against Seq-Balance's 29.6. At equal compute it is on par with GRPO, the standard baseline.
+Train accuracy is the right end of the curves in the figure below: answers sampled before each update, over the last 20M weighted tokens of total compute. At equal total compute, our algorithm and GRPO-8 end level on the held-out prompts, 53.7% against 53.2%, a difference of 0.5 points [−3.8, +4.9], while on the training prompts our algorithm is 2.6 points ahead. At equal training compute, our algorithm is ahead on the held-out prompts too. After 75 updates it has used 1.28 EFLOPs of training compute and reaches 53.8%, while GRPO-8 after 75 updates has used 1.36 EFLOPs and reaches 47.4%, a gap of 6.4 points [2.0, 11.0]. Brackets are 95% paired bootstrap intervals over the 60 held-out prompts. Seq-Balance ends at 47.4% on the held-out prompts, with 16% less total compute. On the training prompts, our algorithm pulls ahead after about 1.5 EFLOPs of total compute:
+
+<figure>
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/train-accuracy-vs-compute.png' | relative_url }}"><img src="{{ '/assets/images/train-accuracy-vs-compute.png' | relative_url }}" alt="Accuracy on the training prompts against total compute and against training compute for Seq-Balance, GRPO-8 and our algorithm. Our algorithm pulls ahead of both after about 1.5 EFLOPs of total compute." loading="lazy"></a>
+  <figcaption>Accuracy on the training prompts, from answers sampled before each update (the first four per prompt for our algorithm and Seq-Balance, all eight for GRPO-8), pooled over a trailing window of 20M weighted tokens of total compute (left) or 8M of training compute (right).</figcaption>
+</figure>
+
+These are single training runs, and the intervals cover only the choice of held-out prompts, not the training seed.
 
 ## 5. Next steps {#open}
 
-Everything in this post is small scale: one 8B model, a replay on a single checkpoint with eight prompts, and one training seed per method. Even at this scale, the scientific picture is clear and positive. The assumptions behind Neyman allocation for pairs hold, our algorithm cuts gradient variance by 39% at equal compute, and it beats Seq-Balance in training. Translating lower variance into a reliable performance gain will take more scale and more iteration:
+Everything here is small scale: one 8B model, one replay checkpoint with eight prompts, and one training seed per method. Next:
 
-- **Training at scale.** With one seed, our algorithm is on par with GRPO at equal compute rather than ahead of it, and Seq-Balance's 100 updates used about 18% less compute than ours (its run also used slightly different grader references). Several seeds, larger models and longer runs, with a shared reward objective across methods, would show how much of the lower variance turns into faster learning.
-- **More baselines and settings.** A GRPO arm in the gradient replay, and the replay repeated across prompt batches and stages of training.
-- **Assumption A4.** How well the history-based estimates of $$p_i$$ and $$T_i$$ track the truth, and how much the expected-pair approximation costs.
+- **Scale.** More seeds, larger models and longer runs, to see how much of the lower variance turns into faster learning.
+- **Planning in rounds.** Re-plan after each block of follow-ups instead of once after the probe. Theorem 1 still applies, because the plan still depends only on grades.
+- **More settings.** Replays across prompt batches and stages of training, and how well the history-based weights and forecasts track the truth.
 
 ## Citation {#citation}
 
@@ -360,7 +431,7 @@ Everything in this post is small scale: one 8B model, a replay on a single check
 ```bibtex
 @misc{chen2026adaptivesampling,
   author = {Chen, Chang-Han},
-  title  = {The Science of Adaptive Sampling},
+  title  = {How to think about compute-optimal adaptive sampling?},
   year   = {2026},
   url    = {https://chang-han-chen.github.io/science-adaptive-sampling/},
   note   = {Blog post}
@@ -372,6 +443,7 @@ Everything in this post is small scale: one 8B model, a replay on a single check
 
 <div class="references" markdown="1">
 
+1. {: #ref-chung2021} W. Chung, V. Thomas, M. C. Machado, and N. Le Roux. [Beyond variance reduction: Understanding the true impact of baselines on policy optimization](https://arxiv.org/abs/2008.13773). *ICML*, 2021.
 1. {: #ref-deepseek2025} DeepSeek-AI. [DeepSeek-R1: Incentivizing reasoning capability in LLMs via reinforcement learning](https://arxiv.org/abs/2501.12948). arXiv:2501.12948, 2025.
 1. {: #ref-hu2026} H. Hu, X. Zhao, X. Xu, and N. Jacoby. [DUET: Optimize token-budget allocation for reinforcement learning with verifiable rewards](https://arxiv.org/abs/2605.08441). arXiv:2605.08441, 2026.
 1. {: #ref-khatri2025} D. Khatri et al. [The art of scaling reinforcement learning compute for LLMs](https://arxiv.org/abs/2510.13786). arXiv:2510.13786, 2025.
@@ -385,7 +457,6 @@ Everything in this post is small scale: one 8B model, a replay on a single check
 1. {: #ref-openai2024} OpenAI. [OpenAI o1 system card](https://arxiv.org/abs/2412.16720). arXiv:2412.16720, 2024.
 1. {: #ref-qu2026} Y. Qu, A. Setlur, V. Smith, R. Salakhutdinov, and A. Kumar. [POPE: Learning to reason on hard problems via privileged on-policy exploration](https://arxiv.org/abs/2601.18779). arXiv:2601.18779, 2026.
 1. {: #ref-dataset} RLHFlow. [reinforce_ada_hard_prompt](https://huggingface.co/datasets/RLHFlow/reinforce_ada_hard_prompt) (dataset). Hugging Face.
-1. {: #ref-tajwar2026} F. Tajwar et al. [Maximum likelihood reinforcement learning](https://arxiv.org/abs/2602.02710). arXiv:2602.02710, 2026. (Large-compute limit: [§4](https://arxiv.org/html/2602.02710#S4).)
 1. {: #ref-tml2026} Thinking Machines Lab. [Introducing Inkling 2 Small](https://thinkingmachines.ai/news/inkling-2-small/). Blog post, November 2026.
 1. {: #ref-tinker} Thinking Machines. [StableReinforce](https://tinker-docs.thinkingmachines.ai/tinker/losses/stable-reinforce/), Tinker documentation.
 1. {: #ref-williams1992} R. J. Williams. Simple statistical gradient-following algorithms for connectionist reinforcement learning. *Machine Learning* 8, 229–256, 1992.
@@ -394,6 +465,7 @@ Everything in this post is small scale: one 8B model, a replay on a single check
 1. {: #ref-yao2025} J. Yao et al. [Optimizing chain-of-thought reasoners via gradient variance minimization in rejection sampling and RL](https://arxiv.org/abs/2505.02391). arXiv:2505.02391, 2025.
 1. {: #ref-yu2025} Q. Yu et al. [DAPO: An open-source LLM reinforcement learning system at scale](https://arxiv.org/abs/2503.14476). *NeurIPS*, 2025.
 1. {: #ref-zheng2025} H. Zheng et al. [Act only when it pays: Efficient reinforcement learning for LLM reasoning via selective rollouts](https://arxiv.org/abs/2506.02177). *NeurIPS*, 2025.
+1. {: #ref-zhu2025} X. Zhu, M. Xia, Z. Wei, W.-L. Chen, D. Chen, and Y. Meng. [The surprising effectiveness of negative reinforcement in LLM reasoning](https://arxiv.org/abs/2506.01347). *NeurIPS*, 2025.
 
 </div>
 
@@ -401,33 +473,27 @@ Everything in this post is small scale: one 8B model, a replay on a single check
 
 ### A. Score energy across layers {#app-energy}
 
-Here is the A1 check in three parameter groups, on the same 40 Qwen3-4B prompts and 48 rollouts each as §3, with the prompt effect divided out. Each bin is a length octile, with ±2σ error bars. Layers 18–35 and the final norm both scale close to linearly in length. In layers 0–8, heavy tails dominate a fit on the mean (exponent 0.78 ± 1.73), while a fit on log energy, which is robust to them, gives 0.93 ± 0.06.
+This is the A1 check in three parameter groups, on the same 40 Qwen3-4B prompts and 48 rollouts each as Section 3, with the prompt effect divided out. Each bin is a length octile, with ±2σ error bars. Layers 18–35 and the final norm both scale close to linearly in length. In layers 0–8, heavy tails dominate a fit on the mean (exponent 0.78 ± 1.73), while a fit on log energy, which is robust to them, gives 0.93 ± 0.06.
 
 <figure>
   <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/score-energy-by-length.png' | relative_url }}"><img src="{{ '/assets/images/score-energy-by-length.png' | relative_url }}" alt="Score energy rises with response length in three parameter groups. Correct and incorrect answers nearly overlap in layers 18 to 35 and in the final norm, with much noisier estimates in layers 0 to 8." loading="lazy"></a>
 </figure>
 
-### B. Variance and success rate across prompts {#app-variance}
+### B. Why the mean baseline {#app-baseline}
 
-A1 and A2 predict that plain policy gradient has per-rollout noise $$\operatorname{tr}\operatorname{Cov}((R-p)S)\approx v\,p(1-p)\,T$$ (§3). To check the $$p(1-p)$$ part, we froze Qwen3-4B in thinking mode and, for selected prompts, measured the length-normalized, approximately centered LoRA gradient $$h=(R-p)\widetilde S/\sqrt{T}$$. The left panel below shows its covariance trace, which broadly follows the reference line proportional to $$p(1-p)$$, with visible exceptions. The right panel shows the squared norm of its mean, which varies substantially between prompts.
+Our update uses the group's success rate as its baseline: $$g_i$$ is REINFORCE with advantage $$R-p$$, reweighted to the kept answers. Two other baselines would lower the variance.
 
-<figure>
-  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/gradient-variance-by-reward.png' | relative_url }}"><img src="{{ '/assets/images/gradient-variance-by-reward.png' | relative_url }}" alt="Across selected prompts, length-normalized gradient variance broadly follows reward variance. The squared mean gradient varies substantially between prompts." loading="lazy"></a>
-</figure>
-
-### C. Why we keep the ordinary mean baseline {#app-baseline}
-
-For the IID score estimator $$(R-b)S$$ with a constant baseline $$b$$, the mean gradient does not depend on $$b$$, because $$\mathbb E[S]=0$$. Minimizing its variance gives
+**A length-weighted baseline.** For the estimator $$(R-b)S$$ on all rollouts, the variance-optimal constant baseline is
 
 $$
 b^*=\frac{\mathbb E[R\|S\|^2]}{\mathbb E[\|S\|^2]}
 \;\approx\;\frac{\mathbb E[RT]}{\mathbb E[T]},
 $$
 
-so a long answer counts for more when estimating the baseline. In practice this made little difference on most prompts in the 40-prompt Qwen3-4B study: cross-fitting the length-weighted baseline saved **0.8% ± 1.8%** of the gradient noise on average (two-standard-error band). On one heavily truncated prompt in a deeper follow-up, it saved about **14%**. So our algorithm uses the ordinary, unweighted success rate, with shrinkage for small sample counts, and tracks length only to estimate noise and cost.
-
-The left panel below shows how far the fitted optimum sits from the ordinary mean reward, and the right panel shows how much it saves over that mean when evaluated on separate rollouts. Both describe the IID estimator; they motivate, rather than test, our choice for the balanced update.
+which counts long answers more. In the 40-prompt Qwen3-4B study, cross-fitting it saved **0.8% ± 1.8%** of the gradient noise on average (two-standard-error band), and about **14%** on one heavily truncated prompt. The left panel shows how far the fitted optimum sits from the mean reward, and the right panel what it saves on separate rollouts.
 
 <figure>
   <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/baseline-moments.png' | relative_url }}"><img src="{{ '/assets/images/baseline-moments.png' | relative_url }}" alt="The fitted baseline tracks the length-weighted success rate. Across prompts the out-of-sample noise savings over the mean-reward baseline are small." loading="lazy"></a>
 </figure>
+
+**A baseline chosen with what we keep.** If the weights on $$\bar S_{i,+}$$ and $$\bar S_{i,-}$$ were free, variance would choose the baseline too. Under a training budget it picks $$b=0$$ on hard prompts and $$b=1$$ on easy ones: train on successes only, or on failures only. Both are unbiased, but they push the policy differently. Training on successes alone sharpens it and lowers pass@$$k$$ at large $$k$$, while training on failures alone keeps its diversity ([Zhu et al., 2025](#ref-zhu2025)). In bandits, baselines with equal variance make the policy commit early or keep exploring ([Chung et al., 2021](#ref-chung2021)). We fix the neutral baseline, $$b=p$$, before optimizing anything else.

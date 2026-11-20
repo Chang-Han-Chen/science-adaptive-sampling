@@ -291,3 +291,37 @@ table.paper-table.wrap td:not(:first-child) { min-width: 120px; }
   .trace .ans .tok { display: inline; margin-left: 8px; }
   .trace-prompt { padding: 12px 14px; }
 }
+
+/* ---------- Two-phase figure (three cards, two arrows) ---------- */
+.phase-fig { display: flex; align-items: center; margin: 28px 0 32px; }
+.pf-card { flex: 1 1 0; min-width: 0; padding: 14px 14px 12px; border: 1px solid var(--rule); border-radius: 8px; text-align: center; }
+.pf-title { color: var(--heading); font-size: 15px; font-weight: 600; }
+.pf-sub { margin-top: 2px; color: var(--muted); font-size: 13.5px; }
+.pf-dots { display: flex; flex-wrap: wrap; align-content: center; justify-content: center; gap: 4px; max-width: 116px; min-height: 38px; margin: 8px auto 4px; }
+.pf-dot { width: 10px; height: 10px; border-radius: 50%; background: #d3d8de; }
+.pf-dot.s { background: var(--ok); }
+.pf-card svg { display: block; width: 100%; height: auto; }
+.pf-axis { stroke: #9aa3ad; stroke-width: 1.2; }
+.pf-tick { fill: #6b7580; font-size: 11px; text-anchor: middle; }
+.pf-hi { color: #b8431b; font-weight: 600; }
+.pf-mean { stroke: #b9c0c8; stroke-width: 1; stroke-dasharray: 3 3; }
+.pf-fill { fill: rgba(42, 120, 214, .14); }
+.pf-curve { stroke: var(--phase2); stroke-width: 1.8; }
+.pf-arrow { flex: 0 0 92px; padding: 0 4px; color: var(--heading); font-size: 12.5px; font-weight: 600; line-height: 1.25; text-align: center; }
+.pf-arrow svg { display: block; width: 64px; height: 14px; margin: 6px auto 0; stroke: #7d8790; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+@media (max-width: 640px) {
+  .phase-fig { flex-direction: column; align-items: stretch; }
+  .pf-card { width: 100%; max-width: 320px; margin: 0 auto; }
+  .pf-arrow { display: flex; flex: none; flex-direction: row-reverse; align-items: center; justify-content: center; gap: 8px; padding: 8px 0; }
+  .pf-arrow svg { width: 36px; margin: 0; transform: rotate(90deg); }
+  .pf-card svg { max-width: 250px; margin: 0 auto; }
+}
+
+/* ---------- Placeholder for a pending figure ---------- */
+.todo-figure { margin: 24px 0 28px; padding: 28px 20px; border: 1.5px dashed #d9b44a; border-radius: 8px; background: #fffaf0; color: #8a6d1f; font-size: 14px; text-align: center; }
+.post-body mjx-container[display="true"] { max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+@media (max-width: 520px) {
+  .post-body mjx-container[display="true"] { font-size: 88% !important; }
+  .schematic mjx-container[display="true"] { font-size: 72% !important; }
+  .notice--info mjx-container[display="true"] { font-size: 66% !important; }
+}

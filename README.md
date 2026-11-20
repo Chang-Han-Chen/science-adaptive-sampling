@@ -1,4 +1,4 @@
-# The Science of Adaptive Sampling
+# How to think about compute-optimal adaptive sampling?
 
 The blog post lives in `index.md`. This repository is a small Jekyll site (Markdown + MathJax), built and
 served by GitHub Pages. The layout and styles follow `subliminal-watermarks.github.io`. The experiment
