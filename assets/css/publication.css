@@ -325,3 +325,8 @@ table.paper-table.wrap td:not(:first-child) { min-width: 120px; }
   .schematic mjx-container[display="true"] { font-size: 72% !important; }
   .notice--info mjx-container[display="true"] { font-size: 66% !important; }
 }
+
+/* Three-panel training figure: on phones a stacked image replaces the row; let it keep its height. */
+@media (max-width: 600px) {
+  .post-body figure.three-views img { max-height: none; }
+}

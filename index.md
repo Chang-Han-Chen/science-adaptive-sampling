@@ -25,12 +25,21 @@ We investigate adaptive sampling in RL with verifiable rewards.
    \end{aligned}
    $$
 
-   Of course, how many successes and failures we get depends on how the extra rollouts come out, so the plan covers every possible outcome, and we count tokens in expectation.
-3. We solve it exactly, with a small mixed-integer program. The accuracy gradient points from the average failure to the average success, so we need both, and the rarer outcome is the bottleneck. The optimal plan is **Neyman allocation over (prompt, outcome) pairs**: each prompt aims for about as many successes as failures, whatever their lengths, and buys more rollouts only while the outcome it is short of is worth the price. We also prove that the resulting update always points along the accuracy gradient.
+   Of course, the numbers of successes and failures at our disposal after sampling vary from run to run, so our algorithm also adapts to all possible scenarios.
+3. We solve the optimization problem exactly with an integer program solver. Intuitively, the update compares the average success with the average failure, so its noise is set mostly by whichever outcome we have fewer of. With 1 success and 7 failures, one more success cuts the noise by almost half, while one more failure cuts it by under 2%. So the solver spends compute on the rarer outcome. We also prove that the resulting update always points along the accuracy gradient.
 4. We empirically check the noise model behind this on competition-math rollouts from Qwen3-4B.
 5. On a frozen Qwen3-8B checkpoint, our algorithm's gradient has **17% less variance than GRPO-8's at equal compute**.
 6. In training on competition math, our algorithm is **6.4 points ahead of GRPO-8 in held-out accuracy at equal training compute**, and matches it at equal total compute (53.7% vs 53.2%).
 </div>
+
+Here is what this looks like in practice. We train Qwen3-8B on competition math and track accuracy on the training prompts, counting progress three ways: optimizer updates, total compute and training compute. Our algorithm ends highest in all three ([Section 4.2](#training)).
+
+<figure class="three-views">
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/train-accuracy-three-views.png' | relative_url }}"><picture>
+    <source media="(max-width: 600px)" srcset="{{ '/assets/images/train-accuracy-three-views-stacked.png' | relative_url }}">
+    <img src="{{ '/assets/images/train-accuracy-three-views.png' | relative_url }}" alt="Accuracy on the training prompts for Seq-Balance, GRPO-8 and our algorithm, against optimizer updates, total compute and training compute. Our algorithm ends highest in all three panels.">
+  </picture></a>
+</figure>
 
 ## 1. Background: adaptive sampling for LLM RLVR {#background}
 
@@ -408,12 +417,16 @@ are unbiased for $$\operatorname{tr}\operatorname{Cov}(g)$$ and $$\lVert G\rVert
 </table>
 </div>
 
-Train accuracy is the right end of the curves in the figure below: answers sampled before each update, over the last 20M weighted tokens of total compute. At equal total compute, our algorithm and GRPO-8 end level on the held-out prompts, 53.7% against 53.2%, a difference of 0.5 points [−3.8, +4.9], while on the training prompts our algorithm is 2.6 points ahead. At equal training compute, our algorithm is ahead on the held-out prompts too. After 75 updates it has used 1.28 EFLOPs of training compute and reaches 53.8%, while GRPO-8 after 75 updates has used 1.36 EFLOPs and reaches 47.4%, a gap of 6.4 points [2.0, 11.0]. Brackets are 95% paired bootstrap intervals over the 60 held-out prompts. Seq-Balance ends at 47.4% on the held-out prompts, with 16% less total compute. On the training prompts, our algorithm pulls ahead after about 1.5 EFLOPs of total compute:
+Train accuracy is the right end of the middle panel in the figure below. At equal total compute, our algorithm and GRPO-8 end level on the held-out prompts, 53.7% against 53.2%, a difference of 0.5 points [−3.8, +4.9], while on the training prompts our algorithm is 2.6 points ahead. At equal training compute, our algorithm is ahead on the held-out prompts too. After 75 updates it has used 1.28 EFLOPs of training compute and reaches 53.8%, while GRPO-8 after 75 updates has used 1.36 EFLOPs and reaches 47.4%, a gap of 6.4 points [2.0, 11.0]. Brackets are 95% paired bootstrap intervals over the 60 held-out prompts. Seq-Balance ends at 47.4% on the held-out prompts, with 16% less total compute. On the training prompts, our algorithm is ahead of both baselines from about the 20th update on, pulls ahead in total compute after about 1.5 EFLOPs, and leads GRPO-8 for most of the run in training compute:
 
-<figure>
-  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/train-accuracy-vs-compute.png' | relative_url }}"><img src="{{ '/assets/images/train-accuracy-vs-compute.png' | relative_url }}" alt="Accuracy on the training prompts against total compute and against training compute for Seq-Balance, GRPO-8 and our algorithm. Our algorithm pulls ahead of both after about 1.5 EFLOPs of total compute." loading="lazy"></a>
-  <figcaption>Accuracy on the training prompts, from answers sampled before each update (the first four per prompt for our algorithm and Seq-Balance, all eight for GRPO-8), pooled over a trailing window of 20M weighted tokens of total compute (left) or 8M of training compute (right).</figcaption>
+<figure class="three-views">
+  <a class="figure-link" target="_blank" rel="noopener" href="{{ '/assets/images/train-accuracy-three-views.png' | relative_url }}"><picture>
+    <source media="(max-width: 600px)" srcset="{{ '/assets/images/train-accuracy-three-views-stacked.png' | relative_url }}">
+    <img src="{{ '/assets/images/train-accuracy-three-views.png' | relative_url }}" alt="Accuracy on the training prompts for Seq-Balance, GRPO-8 and our algorithm, against optimizer updates, total compute and training compute. Our algorithm ends highest in all three panels." loading="lazy">
+  </picture></a>
 </figure>
+
+Each curve is the accuracy of answers sampled before each update, pooled over a trailing window: the last 10 updates on the left, the last 20M weighted tokens of total compute in the middle, and the last 8M of training compute on the right. The left panel counts the first four answers per prompt for every method; the other two count the first four for our algorithm and Seq-Balance and all eight for GRPO-8.
 
 These are single training runs, and the intervals cover only the choice of held-out prompts, not the training seed.
 
