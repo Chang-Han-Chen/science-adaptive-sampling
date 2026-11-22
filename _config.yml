@@ -1,6 +1,6 @@
-# Project page for "How to think about compute-optimal adaptive sampling?", served by GitHub Pages from main (/).
+# Project page for "Variance reduction and adaptive sampling at fixed inference and training compute", served by GitHub Pages from main (/).
 
-title: "How to think about compute-optimal adaptive sampling?"
+title: "Variance reduction and adaptive sampling at fixed inference and training compute"
 description: "What should we spend the next rollout on, once a prompt already has a learning signal?"
 url: "https://chang-han-chen.github.io"
 baseurl: "/science-adaptive-sampling"

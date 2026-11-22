@@ -1,4 +1,4 @@
-# How to think about compute-optimal adaptive sampling?
+# Variance reduction and adaptive sampling at fixed inference and training compute
 
 The blog post lives in `index.md`. This repository is a small Jekyll site (Markdown + MathJax), built and
 served by GitHub Pages. The layout and styles follow `subliminal-watermarks.github.io`. The experiment
