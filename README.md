@@ -1,4 +1,4 @@
-# Variance reduction and adaptive sampling at fixed inference and training compute
+# Variance reduction, adaptive sampling, and a mystery
 
 The blog post lives in `index.md`. This repository is a small Jekyll site (Markdown + MathJax), built and
 served by GitHub Pages. The layout and styles follow `subliminal-watermarks.github.io`. The experiment
